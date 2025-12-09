@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+vendor/
+
+# Environment files (HASSAS BİLGİLER!)
+.env
+.env.local
+.env.production
+*.env
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Database
+*.db
+*.sqlite
+
+# Docker volumes (local)
+postgres_data/
+
+# Temp files
+tmp/
+temp/
+*.tmp
+
+# Coverage
+coverage/
+*.cover
+*.coverage
+

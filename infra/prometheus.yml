@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 5s # Her 5 saniyede bir verilere bak
+
+scrape_configs:
+  - job_name: 'api_gateway'
+    static_configs:
+      - targets: ['host.docker.internal:8080'] # Gateway'i dinle
+  
+  - job_name: 'product_service'
+    static_configs:
+      - targets: ['host.docker.internal:3001'] # Product Service'i dinle
+
+  - job_name: 'order_service'
+    static_configs:
+      - targets: ['host.docker.internal:3004']
+
+  - job_name: 'search_service'
+    static_configs:
+      - targets: ['host.docker.internal:3006']

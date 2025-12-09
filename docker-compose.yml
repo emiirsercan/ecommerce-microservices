@@ -1,0 +1,67 @@
+services:
+  prometheus:
+    image: prom/prometheus
+    container_name: ecommerce_prometheus
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - ecommerce_net
+
+  grafana:
+    image: grafana/grafana
+    container_name: ecommerce_grafana
+    ports:
+      - "3007:3000" # Frontend (3000) ile çakışmasın diye 3001 yaptık
+    networks:
+      - ecommerce_net
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+    container_name: ecommerce_elastic
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m" # RAM'i sömürmesin diye limit koyuyoruz
+    ports:
+      - "9200:9200"
+    networks:
+      - ecommerce_net
+  # 1. PostgreSQL Veritabanı
+  postgres:
+    image: postgres:15-alpine
+    container_name: ecommerce_db
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password 
+      POSTGRES_DB: ecommerce
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ecommerce_net
+
+  # 2. Redis Cache
+  redis:
+    image: redis:alpine
+    container_name: ecommerce_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - ecommerce_net
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: ecommerce_rabbitmq
+    ports:
+      - "5672:5672"   # Mesajlaşma portu (Servisler buraya konuşur)
+      - "15672:15672" # Yönetim paneli (Tarayıcıdan gireceğiz)
+    networks:
+      - ecommerce_net
+# Verilerin kaybolmaması için Volume tanımı
+volumes:
+  postgres_data:
+
+# Ağ Tanımı (Hatanın sebebi burasının eksik olmasıydı)
+networks:
+  ecommerce_net:
+    driver: bridge
