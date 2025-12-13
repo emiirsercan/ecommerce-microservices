@@ -1,4 +1,15 @@
 services:
+  
+  mongo:
+    image: mongo:latest
+    container_name: ecommerce_mongo
+    ports:
+      - "27017:27017" # MongoDB'nin standart portu
+    volumes:
+      - mongo_data:/data/db # Veriler kaybolmasın
+    networks:
+      - ecommerce_net
+
   prometheus:
     image: prom/prometheus
     container_name: ecommerce_prometheus
@@ -60,6 +71,7 @@ services:
 # Verilerin kaybolmaması için Volume tanımı
 volumes:
   postgres_data:
+  mongo_data:
 
 # Ağ Tanımı (Hatanın sebebi burasının eksik olmasıydı)
 networks:

@@ -16,6 +16,11 @@ import (
 	"gorm.io/gorm"
 )
 
+// Statü güncelleme için gelen istek
+type UpdateStatusRequest struct {
+	Status string `json:"status"`
+}
+
 type OrderItem struct {
 	ProductID int `json:"product_id"`
 	Quantity  int `json:"quantity"`
@@ -180,6 +185,34 @@ func main() {
 			return c.Status(500).JSON(fiber.Map{"error": "Siparişler çekilemedi"})
 		}
 		return c.JSON(orders)
+	})
+
+	// --- 3. Sipariş Durumu Güncelle (PATCH) ---
+	// Admin panelinden gelecek istek: "Bu siparişin durumunu 'Kargolandı' yap"
+	app.Patch("/orders/:id/status", func(c *fiber.Ctx) error {
+		id := c.Params("id")
+
+		req := new(UpdateStatusRequest)
+		if err := c.BodyParser(req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Hatalı veri"})
+		}
+
+		// Veritabanında güncelle
+		var order Order
+		// Önce sipariş var mı bak
+		if err := DB.First(&order, id).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Sipariş bulunamadı"})
+		}
+
+		// Durumu güncelle
+		order.Status = req.Status
+		DB.Save(&order)
+
+		// (Senior Notu: Burada RabbitMQ'ya "Sipariş durumu değişti" eventi atılırsa,
+		// Notification Service müşteriye "Kargonuz yola çıktı" maili atabilir.
+		// Şimdilik sadece DB güncelliyoruz.)
+
+		return c.JSON(fiber.Map{"message": "Durum güncellendi", "order": order})
 	})
 
 	log.Fatal(app.Listen(":3004"))

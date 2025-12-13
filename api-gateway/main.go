@@ -93,6 +93,18 @@ func main() {
 		url := "http://localhost:3006" + c.OriginalURL()[4:]
 		return proxy.Do(c, url)
 	})
+	// 6. Review Service (YENİ) - Port 3008
+	app.Group("/api/reviews", func(c *fiber.Ctx) error {
+		// /api/reviews/10 -> http://localhost:3008/reviews/10
+		url := "http://localhost:3008/reviews" + c.Path()[len("/api/reviews"):]
+		return proxy.Do(c, url)
+	})
+	// 7. Wishlist Service (YENİ) - Port 3009
+	app.Group("/api/wishlist", func(c *fiber.Ctx) error {
+		// /api/wishlist/5 -> http://localhost:3009/wishlist/5
+		url := "http://localhost:3009/wishlist" + c.Path()[len("/api/wishlist"):]
+		return proxy.Do(c, url)
+	})
 
 	log.Fatal(app.Listen(":8080"))
 }

@@ -193,6 +193,48 @@ func main() {
 		// Her şey yolunda
 		return c.Status(200).JSON(fiber.Map{"message": "Stok uygun"})
 	})
+	// --- SENKRONİZASYON ENDPOINT'İ (YENİ) ---
+	// Kullanımı: POST http://localhost:3001/products/sync
+	app.Post("/products/sync", func(c *fiber.Ctx) error {
+		// 1. Tüm ürünleri DB'den çek
+		var products []Product
+		if result := DB.Find(&products); result.Error != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Veritabanından ürünler okunamadı"})
+		}
+
+		fmt.Printf("🔄 Senkronizasyon Başladı! Toplam %d ürün aktarılacak...\n", len(products))
+
+		// 2. Her bir ürünü RabbitMQ'ya gönder
+		successCount := 0
+		for _, p := range products {
+			messageBody, _ := json.Marshal(p)
+
+			// 'product_created' kuyruğuna atıyoruz (Search Service bunu dinliyor)
+			err := ch.Publish(
+				"",                // Exchange (Boş bırakıyoruz, direkt kuyruğa)
+				"product_created", // Routing Key (Kuyruk Adı)
+				false,
+				false,
+				amqp.Publishing{
+					ContentType: "application/json",
+					Body:        messageBody,
+					Timestamp:   time.Now(),
+				})
+
+			if err != nil {
+				fmt.Printf("❌ Hata (%s): %s\n", p.Name, err)
+			} else {
+				fmt.Printf("📤 Gönderildi: %s\n", p.Name)
+				successCount++
+			}
+		}
+
+		return c.JSON(fiber.Map{
+			"message":      "Senkronizasyon tamamlandı",
+			"total_found":  len(products),
+			"total_synced": successCount,
+		})
+	})
 
 	app.Use(jwtware.New(jwtware.Config{
 		SigningKey: jwtware.SigningKey{Key: []byte(SecretKey)},
