@@ -43,12 +43,23 @@ type StockCheckReq struct {
 	} `json:"items"`
 }
 
+// --- KATEGORİ MODELİ ---
+type Category struct {
+	gorm.Model
+	Name     string `json:"name"`
+	Slug     string `json:"slug" gorm:"unique"` // URL-friendly: "telefonlar", "bilgisayarlar"
+	ParentID *uint  `json:"parent_id"`          // Alt kategoriler için (nullable)
+	Icon     string `json:"icon"`               // Lucide icon adı: "smartphone", "laptop"
+}
+
 type Product struct {
 	gorm.Model
-	Name  string `json:"name"`
-	Code  string `json:"code"`
-	Price uint   `json:"price"`
-	Stock int    `json:"stock"`
+	Name       string    `json:"name"`
+	Code       string    `json:"code"`
+	Price      uint      `json:"price"`
+	Stock      int       `json:"stock"`
+	CategoryID *uint     `json:"category_id"`                           // Kategori ID (nullable)
+	Category   *Category `json:"category" gorm:"foreignKey:CategoryID"` // İlişki
 }
 
 type OrderItem struct {
@@ -68,7 +79,33 @@ func initDatabase() {
 		log.Fatal("DB Hatası: ", err)
 	}
 	fmt.Println("🚀 Product DB Bağlandı!")
-	DB.AutoMigrate(&Product{})
+
+	// Önce Category, sonra Product (Foreign Key ilişkisi için)
+	DB.AutoMigrate(&Category{}, &Product{})
+
+	// Varsayılan kategorileri oluştur (eğer yoksa)
+	seedCategories()
+}
+
+// Varsayılan kategorileri oluşturur
+func seedCategories() {
+	categories := []Category{
+		{Name: "Elektronik", Slug: "elektronik", Icon: "laptop"},
+		{Name: "Telefonlar", Slug: "telefonlar", Icon: "smartphone"},
+		{Name: "Bilgisayarlar", Slug: "bilgisayarlar", Icon: "monitor"},
+		{Name: "Kulaklıklar", Slug: "kulakliklar", Icon: "headphones"},
+		{Name: "Aksesuarlar", Slug: "aksesuarlar", Icon: "watch"},
+		{Name: "Oyun", Slug: "oyun", Icon: "gamepad-2"},
+	}
+
+	for _, cat := range categories {
+		// Slug'a göre var mı kontrol et, yoksa ekle
+		var existing Category
+		if DB.Where("slug = ?", cat.Slug).First(&existing).Error != nil {
+			DB.Create(&cat)
+			fmt.Printf("📁 Kategori oluşturuldu: %s\n", cat.Name)
+		}
+	}
 }
 
 func failOnError(err error, msg string) {
@@ -153,17 +190,212 @@ func main() {
 		AllowMethods: "GET, POST, HEAD, PUT, DELETE, PATCH, OPTIONS",
 	}))
 
-	// ROTALAR
-	app.Get("/products", func(c *fiber.Ctx) error {
-		var products []Product
-		DB.Find(&products)
-		return c.JSON(products)
+	// =====================
+	// KATEGORİ ENDPOINT'LERİ
+	// =====================
+
+	// Tüm kategorileri getir
+	app.Get("/categories", func(c *fiber.Ctx) error {
+		var categories []Category
+		DB.Find(&categories)
+		return c.JSON(categories)
 	})
 
+	// Tek kategori getir (slug ile)
+	app.Get("/categories/:slug", func(c *fiber.Ctx) error {
+		slug := c.Params("slug")
+		var category Category
+		if err := DB.Where("slug = ?", slug).First(&category).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Kategori bulunamadı"})
+		}
+		return c.JSON(category)
+	})
+
+	// =====================
+	// ÜRÜN ENDPOINT'LERİ
+	// =====================
+
+	/*
+	   =====================================================================
+	   ÜRÜN LİSTESİ - PAGİNATİON DESTEKLİ
+	   =====================================================================
+
+	   💡 PAGİNATİON NEDİR?
+
+	      Veritabanında 10.000 ürün var diyelim.
+	      Hepsini tek seferde çekmek:
+	      - Yavaş (10 saniye)
+	      - Hafıza tüketir (100MB+)
+	      - Frontend donar
+
+	      Pagination ile:
+	      - Sadece 20 ürün çek (200ms)
+	      - Hafıza az kullanılır (500KB)
+	      - Frontend akıcı çalışır
+
+	   📝 KULLANIM:
+	      GET /products?page=1&limit=20
+	      GET /products?page=2&limit=20&category=5&sort=price_asc
+
+	   📤 RESPONSE FORMAT:
+	      {
+	        "data": [...products],
+	        "pagination": {
+	          "current_page": 1,
+	          "per_page": 20,
+	          "total_items": 150,
+	          "total_pages": 8,
+	          "has_next": true,
+	          "has_prev": false
+	        }
+	      }
+	*/
+	app.Get("/products", func(c *fiber.Ctx) error {
+		var products []Product
+		var totalItems int64
+
+		// =================================================================
+		// 1. PAGİNATİON PARAMETRELERİ
+		// =================================================================
+		/*
+		   QueryInt: String'i int'e çevirir, hata olursa default değer döner
+
+		   page=1 → İlk sayfa
+		   limit=20 → Sayfa başına 20 ürün (max 100 - güvenlik için)
+
+		   Offset hesaplama:
+		   page=1 → offset=0  (ilk 20 ürün)
+		   page=2 → offset=20 (21-40 arası)
+		   page=3 → offset=40 (41-60 arası)
+
+		   Formül: offset = (page - 1) * limit
+		*/
+		page := c.QueryInt("page", 1)
+		limit := c.QueryInt("limit", 20)
+
+		// Güvenlik: Negatif değerleri engelle
+		if page < 1 {
+			page = 1
+		}
+		if limit < 1 {
+			limit = 20
+		}
+		if limit > 100 {
+			limit = 100 // Max 100 - Biri ?limit=999999 yazmasın diye
+		}
+
+		offset := (page - 1) * limit
+
+		// =================================================================
+		// 2. FİLTRELEME
+		// =================================================================
+		query := DB.Model(&Product{}).Preload("Category")
+
+		// ?category=5 → Kategoriye göre filtrele
+		if categoryID := c.Query("category"); categoryID != "" {
+			query = query.Where("category_id = ?", categoryID)
+		}
+
+		// ?min=100&max=500 → Fiyat aralığı
+		if minPrice := c.Query("min"); minPrice != "" {
+			query = query.Where("price >= ?", minPrice)
+		}
+		if maxPrice := c.Query("max"); maxPrice != "" {
+			query = query.Where("price <= ?", maxPrice)
+		}
+
+		// ?stock=true → Sadece stokta olanlar
+		if inStock := c.Query("stock"); inStock == "true" {
+			query = query.Where("stock > 0")
+		}
+
+		// ?search=iphone → İsimde ara
+		if search := c.Query("search"); search != "" {
+			query = query.Where("name ILIKE ?", "%"+search+"%")
+		}
+
+		// =================================================================
+		// 3. TOPLAM SAYIYI HESAPLA (Pagination için gerekli)
+		// =================================================================
+		/*
+		   Count(): Filtrelere uyan toplam kayıt sayısı
+		   Bu değer pagination UI için gerekli:
+		   - "150 ürün bulundu"
+		   - "Toplam 8 sayfa"
+		*/
+		query.Count(&totalItems)
+
+		// =================================================================
+		// 4. SIRALAMA
+		// =================================================================
+		sort := c.Query("sort")
+		switch sort {
+		case "price_asc":
+			query = query.Order("price ASC")
+		case "price_desc":
+			query = query.Order("price DESC")
+		case "newest":
+			query = query.Order("created_at DESC")
+		case "oldest":
+			query = query.Order("created_at ASC")
+		default:
+			query = query.Order("created_at DESC")
+		}
+
+		// =================================================================
+		// 5. PAGİNATİON UYGULA VE VERİYİ ÇEK
+		// =================================================================
+		/*
+		   Offset(offset): Kaç kayıt atlanacak
+		   Limit(limit): Kaç kayıt alınacak
+
+		   SQL Karşılığı:
+		   SELECT * FROM products
+		   WHERE ... (filtreler)
+		   ORDER BY created_at DESC
+		   LIMIT 20 OFFSET 40
+		*/
+		query.Offset(offset).Limit(limit).Find(&products)
+
+		// =================================================================
+		// 6. PAGİNATİON META VERİSİ HESAPLA
+		// =================================================================
+		/*
+		   totalPages hesaplama:
+		   totalItems=150, limit=20 → 150/20 = 7.5 → 8 sayfa
+
+		   Ceiling (yukarı yuvarlama) için:
+		   (150 + 20 - 1) / 20 = 169 / 20 = 8
+		*/
+		totalPages := int64(0)
+		if totalItems > 0 {
+			totalPages = (totalItems + int64(limit) - 1) / int64(limit)
+		}
+
+		hasNext := int64(page) < totalPages
+		hasPrev := page > 1
+
+		// =================================================================
+		// 7. RESPONSE
+		// =================================================================
+		return c.JSON(fiber.Map{
+			"products": products, // Frontend "products" bekliyor
+			"pagination": fiber.Map{
+				"current_page": page,
+				"per_page":     limit,
+				"total_items":  totalItems,
+				"total_pages":  totalPages,
+				"has_next":     hasNext,
+				"has_prev":     hasPrev,
+			},
+		})
+	})
+
+	// Tek ürün getir
 	app.Get("/products/:id", func(c *fiber.Ctx) error {
 		id := c.Params("id")
 		var product Product
-		if err := DB.First(&product, id).Error; err != nil {
+		if err := DB.Preload("Category").First(&product, id).Error; err != nil {
 			return c.Status(404).JSON(fiber.Map{"error": "Bulunamadı"})
 		}
 		return c.JSON(product)
@@ -243,24 +475,82 @@ func main() {
 		},
 	}))
 
+	// Yeni ürün ekle
 	app.Post("/products", func(c *fiber.Ctx) error {
 		product := new(Product)
 		if err := c.BodyParser(product); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "Veri hatası"})
 		}
 
+		// Kategori ID verilmişse, var mı kontrol et
+		if product.CategoryID != nil {
+			var category Category
+			if err := DB.First(&category, *product.CategoryID).Error; err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": "Geçersiz kategori ID"})
+			}
+		}
+
 		if result := DB.Create(&product); result.Error != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "DB Kayıt Hatası"})
 		}
 
+		// Kategori bilgisini de yükle
+		DB.Preload("Category").First(&product, product.ID)
+
 		// Yeni ürün eklendi eventini fırlat (Search Service için)
-		// Burası direkt kuyruğa atıyor, Search Service de o kuyruğu dinliyor.
 		messageBody, _ := json.Marshal(product)
 		ch.Publish("", qProduct.Name, false, false, amqp.Publishing{
 			ContentType: "application/json", Body: messageBody, Timestamp: time.Now(),
 		})
 
 		return c.Status(201).JSON(product)
+	})
+
+	// Ürün güncelle (PUT)
+	app.Put("/products/:id", func(c *fiber.Ctx) error {
+		id := c.Params("id")
+		var product Product
+		if err := DB.First(&product, id).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Ürün bulunamadı"})
+		}
+
+		// Gelen veriyi parse et
+		var updateData Product
+		if err := c.BodyParser(&updateData); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Veri hatası"})
+		}
+
+		// Kategori ID verilmişse, var mı kontrol et
+		if updateData.CategoryID != nil {
+			var category Category
+			if err := DB.First(&category, *updateData.CategoryID).Error; err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": "Geçersiz kategori ID"})
+			}
+		}
+
+		// Güncelle
+		DB.Model(&product).Updates(updateData)
+		DB.Preload("Category").First(&product, id)
+
+		return c.JSON(product)
+	})
+
+	// Ürün sil (DELETE)
+	app.Delete("/products/:id", func(c *fiber.Ctx) error {
+		id := c.Params("id")
+		var product Product
+		if err := DB.First(&product, id).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Ürün bulunamadı"})
+		}
+
+		// Soft delete (GORM varsayılan olarak soft delete yapar - deleted_at alanını doldurur)
+		if err := DB.Delete(&product).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Ürün silinemedi"})
+		}
+
+		fmt.Printf("🗑️ Ürün silindi: %s (ID: %s)\n", product.Name, id)
+
+		return c.JSON(fiber.Map{"message": "Ürün başarıyla silindi", "deleted_id": id})
 	})
 
 	log.Fatal(app.Listen(":3001"))

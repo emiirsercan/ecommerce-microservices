@@ -10,60 +10,141 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
-	"github.com/lib/pq"
 	"github.com/streadway/amqp"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
-// Statü güncelleme için gelen istek
+// ==============================================================================
+// VERİTABANI MODELLERİ
+// ==============================================================================
+
+/*
+Order: Ana sipariş modeli
+
+💡 YENİ ALANLAR:
+  - SubTotal: Kupon öncesi toplam (muhasebe için)
+  - CouponCode: Kullanılan kupon kodu ("HOSGELDIN")
+  - CouponDiscount: İndirim tutarı (75 TL)
+  - ShippingAddress: Teslimat adresi
+  - Items: İlişkili ürünler (GORM hasMany)
+
+gorm.Model otomatik ekler:
+  - ID (uint)
+  - CreatedAt (time.Time)
+  - UpdatedAt (time.Time)
+  - DeletedAt (soft delete için)
+*/
+type Order struct {
+	gorm.Model
+	UserID          uint        `json:"user_id"`
+	SubTotal        float64     `json:"sub_total"`       // Kupon ÖNCESİ tutar
+	CouponCode      string      `json:"coupon_code"`     // Kullanılan kupon: "HOSGELDIN"
+	CouponDiscount  float64     `json:"coupon_discount"` // İndirim tutarı: 75
+	TotalPrice      float64     `json:"total_price"`     // Kupon SONRASI tutar
+	Status          string      `json:"status" gorm:"default:'Hazırlanıyor'"`
+	ShippingAddress string      `json:"shipping_address"`                // Teslimat adresi
+	Items           []OrderItem `json:"items" gorm:"foreignKey:OrderID"` // İlişkili ürünler
+}
+
+type OrderItem struct {
+	gorm.Model
+	OrderID      uint    `json:"order_id"`      // Hangi siparişe ait?
+	ProductID    uint    `json:"product_id"`    // Ürün ID (referans için)
+	ProductName  string  `json:"product_name"`  // O anki ürün adı
+	ProductImage string  `json:"product_image"` // O anki ürün resmi
+	UnitPrice    float64 `json:"unit_price"`    // O anki birim fiyat
+	Quantity     int     `json:"quantity"`      // Adet
+	SubTotal     float64 `json:"sub_total"`     // Adet x Fiyat
+}
+
+// ==============================================================================
+// REQUEST/RESPONSE MODELLERİ (DTO'lar)
+// ==============================================================================
+
+/*
+DTO (Data Transfer Object) Nedir?
+
+Veritabanı modeli ile API arasında köprü görevi görür.
+- Frontend'den gelen veriyi parse eder
+- Gereksiz alanları gizler
+- Validasyon için kullanılır
+
+Neden ayrı?
+- Order struct'ında gorm.Model var (ID, CreatedAt vs.)
+- Ama frontend bunları göndermemeli, biz oluşturmalıyız
+*/
+
+// CreateOrderRequest: Frontend'den gelen sipariş isteği
+type CreateOrderRequest struct {
+	UserID     uint             `json:"user_id"`
+	Items      []OrderItemInput `json:"items"`       // Sepetteki ürünler
+	SubTotal   float64          `json:"sub_total"`   // Kupon öncesi tutar
+	TotalPrice float64          `json:"total_price"` // Kupon sonrası tutar
+
+	// Kupon bilgileri (opsiyonel - kupon kullanılmayabilir)
+	CouponCode     string  `json:"coupon_code"`
+	CouponDiscount float64 `json:"coupon_discount"`
+
+	// Ödeme bilgileri
+	CardNumber string `json:"card_number"`
+	CVV        string `json:"cvv"`
+	Expiry     string `json:"expiry"`
+
+	// Teslimat
+	ShippingAddress string `json:"shipping_address"`
+}
+
+// OrderItemInput: Sepetten gelen ürün bilgisi
+type OrderItemInput struct {
+	ProductID    uint    `json:"product_id"`
+	ProductName  string  `json:"product_name"`
+	ProductImage string  `json:"product_image"`
+	UnitPrice    float64 `json:"unit_price"`
+	Quantity     int     `json:"quantity"`
+}
+
+// UpdateStatusRequest: Admin'den gelen durum güncelleme
 type UpdateStatusRequest struct {
 	Status string `json:"status"`
 }
 
-type OrderItem struct {
-	ProductID int `json:"product_id"`
-	Quantity  int `json:"quantity"`
-}
-
-// Frontend'den gelecek istek modeli
-type CreateOrderRequest struct {
-	UserID     int         `json:"user_id"`
-	Items      []OrderItem `json:"items"`
-	TotalPrice float64     `json:"total_price"`
-	CardNumber string      `json:"card_number"`
-	CVV        string      `json:"cvv"`
-	Expiry     string      `json:"expiry"`
-}
-
-// Veritabanı Modeli
-type Order struct {
-	gorm.Model
-	ProductIDs pq.Int64Array `json:"product_ids" gorm:"type:integer[]"`
-	UserID     int           `json:"user_id"`
-	TotalPrice float64       `json:"total_price"`
-	Status     string        `json:"status" gorm:"default:'Hazırlanıyor'"`
-}
-
-// RabbitMQ'ya atılacak mesaj (Product Service ile uyumlu olmalı)
+// OrderEvent: RabbitMQ'ya gönderilecek stok düşürme eventi
 type OrderEvent struct {
-	Items []OrderItem `json:"items"`
+	Items []struct {
+		ProductID int `json:"product_id"`
+		Quantity  int `json:"quantity"`
+	} `json:"items"`
 }
 
 var DB *gorm.DB
 var ch *amqp.Channel
 
-// var q amqp.Queue  <--Bunu sildik, artık Exchange kullanacağız
+// ==============================================================================
+// VERİTABANI BAĞLANTISI
+// ==============================================================================
 
 func initDatabase() {
 	dsn := "host=localhost user=user password=password dbname=ecommerce port=5432 sslmode=disable"
 	var err error
 	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
-		log.Fatal("DB Hatası:", err)
+		log.Fatal("❌ Order Service DB Hatası:", err)
 	}
-	DB.AutoMigrate(&Order{})
-	fmt.Println("🚀 Order DB Bağlandı")
+
+	/*
+	   AutoMigrate: Her iki tabloyu da oluştur/güncelle
+
+	   ⚠️ DİKKAT: GORM AutoMigrate şunları yapabilir:
+	      ✅ Yeni tablo oluşturma
+	      ✅ Yeni kolon ekleme
+	      ❌ Kolon silme (güvenlik için yapmaz)
+	      ❌ Kolon tipi değiştirme
+
+	   Production'da: Flyway, Goose gibi migration tool'ları kullan
+	*/
+	DB.AutoMigrate(&Order{}, &OrderItem{})
+	fmt.Println("🚀 Order Service Veritabanına Bağlandı!")
 }
 
 func failOnError(err error, msg string) {
@@ -84,16 +165,15 @@ func main() {
 	failOnError(err, "Kanal açılamadı")
 	defer ch.Close()
 
-	// --- DEĞİŞİKLİK 1: KUYRUK YERİNE EXCHANGE TANIMLIYORUZ ---
-	// "order_fanout" adında bir santral kuruyoruz. Tipi: "fanout" (Herkese yay)
+	// Fanout Exchange tanımla (stok düşürme için)
 	err = ch.ExchangeDeclare(
-		"order_fanout", // Exchange Adı
-		"fanout",       // Tipi (Yayın yap)
-		true,           // Durable (Kalıcı)
-		false,          // Auto-deleted
-		false,          // Internal
-		false,          // No-wait
-		nil,            // Arguments
+		"order_fanout",
+		"fanout",
+		true,
+		false,
+		false,
+		false,
+		nil,
 	)
 	failOnError(err, "Exchange oluşturulamadı")
 
@@ -105,19 +185,33 @@ func main() {
 		AllowMethods: "GET, POST, HEAD, PUT, DELETE, PATCH, OPTIONS",
 	}))
 
+	// ==========================================================================
+	// ENDPOINT 1: SİPARİŞ OLUŞTUR (POST /orders)
+	// ==========================================================================
+	/*
+	   Bu endpoint en karmaşık olanı. Adım adım:
+
+	   1. Frontend'den veri al
+	   2. Stok kontrolü yap (Product Service'e sor)
+	   3. Ödeme al (Payment Service)
+	   4. Siparişi kaydet (Order + OrderItems)
+	   5. Stok düşür (RabbitMQ ile Product Service'e haber ver)
+
+	   💡 Transaction kullanmıyoruz ama production'da kullanmalısın!
+	      DB.Transaction(func(tx *gorm.DB) error { ... })
+	*/
 	app.Post("/orders", func(c *fiber.Ctx) error {
 		req := new(CreateOrderRequest)
 		if err := c.BodyParser(req); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "Hatalı veri formatı"})
 		}
 
-		// 1. ADIM: STOK KONTROLÜ (Product Service'e Sor) 🛑
+		// 1. ADIM: STOK KONTROLÜ 🛑
 		stockCheckData := map[string]interface{}{
 			"items": req.Items,
 		}
 		stockJSON, _ := json.Marshal(stockCheckData)
 
-		// Product Service (3001) validate endpointine istek at
 		stockRes, err := http.Post("http://localhost:3001/products/validate", "application/json", bytes.NewBuffer(stockJSON))
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Ürün servisine ulaşılamadı"})
@@ -126,13 +220,12 @@ func main() {
 
 		// Stok yoksa işlemi durdur!
 		if stockRes.StatusCode != 200 {
-			// Product service'den gelen detaylı hata mesajını oku ve kullanıcıya ilet
 			var errBody map[string]interface{}
 			json.NewDecoder(stockRes.Body).Decode(&errBody)
 			return c.Status(400).JSON(errBody) // "Yetersiz Stok..." mesajını döner
 		}
 
-		// 2. ADIM: ÖDEME AL (Payment Service) 💳
+		// 2. ADIM: ÖDEME AL 💳
 		paymentData := map[string]interface{}{
 			"card_number": req.CardNumber,
 			"cvv":         req.CVV,
@@ -147,48 +240,277 @@ func main() {
 		}
 
 		// 3. ADIM: SİPARİŞİ KAYDET ✅
-		// (DB için ID listesi lazım, basitçe ID'leri toplayalım)
-		var productIDs []int64
-		for _, item := range req.Items {
-			productIDs = append(productIDs, int64(item.ProductID))
-		}
-
 		order := Order{
-			UserID:     req.UserID,
-			ProductIDs: pq.Int64Array(productIDs), // DB'de sadece ID'leri tutmaya devam edelim şimdilik
-			TotalPrice: req.TotalPrice,
-			Status:     "Hazırlanıyor",
+			UserID:          req.UserID,
+			SubTotal:        req.SubTotal,
+			CouponCode:      req.CouponCode,
+			CouponDiscount:  req.CouponDiscount,
+			TotalPrice:      req.TotalPrice,
+			Status:          "Hazırlanıyor",
+			ShippingAddress: req.ShippingAddress,
 		}
 
+		// Önce ana siparişi kaydet (ID almak için)
 		if result := DB.Create(&order); result.Error != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "DB Kayıt Hatası"})
+			return c.Status(500).JSON(fiber.Map{"error": "Sipariş kaydedilemedi"})
 		}
 
-		// 4. ADIM: STOK DÜŞMEK İÇİN HABER VER 📢
-		// Product Service'in beklediği formatta (adetli) gönderiyoruz
-		eventData := OrderEvent{Items: req.Items}
+		// 4. ADIM: SİPARİŞ ÜRÜNLERİNİ KAYDET 📦
+		/*
+		   Her ürün için OrderItem oluştur ve kaydet.
+		   Neden döngüde? Çünkü her ürünün detayını ayrı kaydetmemiz lazım.
+		*/
+		for _, item := range req.Items {
+			orderItem := OrderItem{
+				OrderID:      order.ID,
+				ProductID:    item.ProductID,
+				ProductName:  item.ProductName,
+				ProductImage: item.ProductImage,
+				UnitPrice:    item.UnitPrice,
+				Quantity:     item.Quantity,
+				SubTotal:     item.UnitPrice * float64(item.Quantity),
+			}
+			DB.Create(&orderItem)
+		}
+
+		// 5. ADIM: STOK DÜŞÜR (Event Gönder) 📢
+		eventItems := make([]struct {
+			ProductID int `json:"product_id"`
+			Quantity  int `json:"quantity"`
+		}, len(req.Items))
+
+		for i, item := range req.Items {
+			eventItems[i].ProductID = int(item.ProductID)
+			eventItems[i].Quantity = item.Quantity
+		}
+
+		eventData := OrderEvent{Items: eventItems}
 		messageBody, _ := json.Marshal(eventData)
 
 		ch.Publish("order_fanout", "", false, false, amqp.Publishing{
-			ContentType: "application/json", Body: messageBody, Timestamp: time.Now(),
+			ContentType: "application/json",
+			Body:        messageBody,
+			Timestamp:   time.Now(),
 		})
 
-		return c.Status(201).JSON(fiber.Map{"message": "Sipariş alındı", "order": order})
+		fmt.Printf("✅ Sipariş oluşturuldu: #%d (Kupon: %s, İndirim: %.2f TL)\n",
+			order.ID, order.CouponCode, order.CouponDiscount)
+
+		return c.Status(201).JSON(fiber.Map{
+			"message": "Sipariş oluşturuldu",
+			"order":   order,
+		})
 	})
 
-	// 2. Siparişleri Getir
-	app.Get("/orders/:userid", func(c *fiber.Ctx) error {
-		userid := c.Params("userid")
+	// ==========================================================================
+	// ENDPOINT 2: TÜM SİPARİŞLERİ GETİR - ADMIN (GET /orders) - PAGİNATİON
+	// ==========================================================================
+	/*
+	   🔐 GÜVENLİK NOTU:
+	   Bu endpoint TÜM siparişleri döner. Production'da JWT role kontrolü gerekli.
+
+	   Bu endpoint TÜM siparişleri döner. Production'da:
+	   1. JWT'den role bilgisini al
+	   2. role == "admin" değilse 403 Forbidden dön
+
+	   Şimdilik basit tutuyoruz, ileride middleware ekleriz.
+
+	   💡 Preload("Items") ne yapar?
+	      - GORM'da "Eager Loading" (Hevesli Yükleme)
+	      - Order'ları çekerken, ilişkili OrderItem'ları da çeker
+	      - Tek sorguda tüm veriyi alır (N+1 problemini önler)
+	*/
+	app.Get("/orders", func(c *fiber.Ctx) error {
 		var orders []Order
-		result := DB.Where("user_id = ?", userid).Order("created_at desc").Find(&orders)
+		var totalItems int64
+
+		// Pagination parametreleri
+		page := c.QueryInt("page", 1)
+		limit := c.QueryInt("limit", 20)
+
+		if page < 1 {
+			page = 1
+		}
+		if limit < 1 || limit > 100 {
+			limit = 20
+		}
+		offset := (page - 1) * limit
+
+		query := DB.Model(&Order{}).Preload("Items")
+
+		// Durum filtresi: ?status=Hazırlanıyor
+		if status := c.Query("status"); status != "" {
+			query = query.Where("status = ?", status)
+		}
+
+		// Kullanıcı filtresi: ?user_id=5
+		if userID := c.Query("user_id"); userID != "" {
+			query = query.Where("user_id = ?", userID)
+		}
+
+		// Toplam sayıyı hesapla
+		query.Count(&totalItems)
+
+		// Sıralama ve pagination uygula
+		result := query.Order("created_at desc").Offset(offset).Limit(limit).Find(&orders)
 		if result.Error != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Siparişler çekilemedi"})
 		}
-		return c.JSON(orders)
+
+		// Pagination meta
+		totalPages := int64(0)
+		if totalItems > 0 {
+			totalPages = (totalItems + int64(limit) - 1) / int64(limit)
+		}
+
+		return c.JSON(fiber.Map{
+			"orders": orders, // Frontend "orders" bekliyor
+			"pagination": fiber.Map{
+				"current_page": page,
+				"per_page":     limit,
+				"total_items":  totalItems,
+				"total_pages":  totalPages,
+				"has_next":     int64(page) < totalPages,
+				"has_prev":     page > 1,
+			},
+		})
 	})
 
-	// --- 3. Sipariş Durumu Güncelle (PATCH) ---
-	// Admin panelinden gelecek istek: "Bu siparişin durumunu 'Kargolandı' yap"
+	// ==========================================================================
+	// ENDPOINT 3: SİPARİŞ İSTATİSTİKLERİ - ADMIN (GET /orders/stats)
+	// ==========================================================================
+	/*
+	   📌 ÖNEMLİ: Bu route /orders/:id'den ÖNCE tanımlanmalı!
+	   Aksi halde "stats" bir ID olarak yorumlanır.
+
+	   Admin dashboard için istatistikler.
+	*/
+	app.Get("/orders/stats", func(c *fiber.Ctx) error {
+		var totalOrders int64
+		var totalRevenue float64
+		var totalDiscount float64
+
+		DB.Model(&Order{}).Count(&totalOrders)
+		DB.Model(&Order{}).Select("COALESCE(SUM(total_price), 0)").Scan(&totalRevenue)
+		DB.Model(&Order{}).Select("COALESCE(SUM(coupon_discount), 0)").Scan(&totalDiscount)
+
+		// Bugünkü siparişler
+		var todayOrders int64
+		today := time.Now().Format("2006-01-02")
+		DB.Model(&Order{}).Where("DATE(created_at) = ?", today).Count(&todayOrders)
+
+		return c.JSON(fiber.Map{
+			"total_orders":   totalOrders,
+			"total_revenue":  totalRevenue,
+			"total_discount": totalDiscount,
+			"today_orders":   todayOrders,
+		})
+	})
+
+	// ==========================================================================
+	// ENDPOINT 4: KULLANICININ SİPARİŞLERİ (GET /orders/user/:userid) - PAGİNATİON
+	// ==========================================================================
+	/*
+	   Profil sayfasında kullanıcının kendi siparişlerini göstermek için.
+
+	   📝 KULLANIM:
+	   GET /orders/user/5?page=1&limit=10
+
+	   💡 Neden ayrı endpoint?
+	      - /orders/:id ile çakışmasın diye path farklı
+	      - Güvenlik: Kullanıcı sadece kendi siparişlerini görmeli
+	*/
+	app.Get("/orders/user/:userid", func(c *fiber.Ctx) error {
+		userid := c.Params("userid")
+		var orders []Order
+		var totalItems int64
+
+		// Pagination
+		page := c.QueryInt("page", 1)
+		limit := c.QueryInt("limit", 10) // Profil sayfası için default 10
+
+		if page < 1 {
+			page = 1
+		}
+		if limit < 1 || limit > 50 {
+			limit = 10
+		}
+		offset := (page - 1) * limit
+
+		query := DB.Model(&Order{}).Preload("Items").Where("user_id = ?", userid)
+
+		// Toplam sayı
+		query.Count(&totalItems)
+
+		// Veriyi çek
+		result := query.Order("created_at desc").Offset(offset).Limit(limit).Find(&orders)
+		if result.Error != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Siparişler çekilemedi"})
+		}
+
+		// Pagination meta
+		totalPages := int64(0)
+		if totalItems > 0 {
+			totalPages = (totalItems + int64(limit) - 1) / int64(limit)
+		}
+
+		return c.JSON(fiber.Map{
+			"orders": orders, // Frontend "orders" bekliyor
+			"pagination": fiber.Map{
+				"current_page": page,
+				"per_page":     limit,
+				"total_items":  totalItems,
+				"total_pages":  totalPages,
+				"has_next":     int64(page) < totalPages,
+				"has_prev":     page > 1,
+			},
+		})
+	})
+
+	// ==========================================================================
+	// ENDPOINT 5: SİPARİŞ DETAYI (GET /orders/:id)
+	// ==========================================================================
+	/*
+	   Tek bir siparişin tüm detaylarını döner.
+	   Kullanım: /orders/[id] sayfası için
+
+	   First vs Find:
+	   - Find: Birden fazla kayıt döner (slice)
+	   - First: Tek kayıt döner, yoksa hata verir
+
+	   Preload("Items"): Siparişteki ürünleri de getir
+	*/
+	app.Get("/orders/:id", func(c *fiber.Ctx) error {
+		id := c.Params("id")
+		var order Order
+
+		result := DB.Preload("Items").First(&order, id)
+		if result.Error != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Sipariş bulunamadı"})
+		}
+
+		return c.JSON(order)
+	})
+
+	// ==========================================================================
+	// ENDPOINT 5: SİPARİŞ DURUMU GÜNCELLE - ADMIN (PATCH /orders/:id/status)
+	// ==========================================================================
+	/*
+	   Admin panelinden sipariş durumunu günceller.
+
+	   Durumlar:
+	   - Hazırlanıyor: Sipariş alındı, paketleniyor
+	   - Kargolandı: Kargo firmasına teslim edildi
+	   - Teslim Edildi: Müşteriye ulaştı
+	   - İptal Edildi: Sipariş iptal edildi
+
+	   💡 SENIOR NOTU:
+	   Burada RabbitMQ'ya "order.status.changed" eventi atılabilir.
+	   Notification Service bu eventi dinleyip müşteriye email/SMS atabilir.
+
+	   Örnek:
+	   ch.Publish("order_events", "order.status.changed", ...)
+	*/
 	app.Patch("/orders/:id/status", func(c *fiber.Ctx) error {
 		id := c.Params("id")
 
@@ -197,22 +519,21 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Hatalı veri"})
 		}
 
-		// Veritabanında güncelle
 		var order Order
-		// Önce sipariş var mı bak
 		if err := DB.First(&order, id).Error; err != nil {
 			return c.Status(404).JSON(fiber.Map{"error": "Sipariş bulunamadı"})
 		}
 
-		// Durumu güncelle
+		oldStatus := order.Status
 		order.Status = req.Status
 		DB.Save(&order)
 
-		// (Senior Notu: Burada RabbitMQ'ya "Sipariş durumu değişti" eventi atılırsa,
-		// Notification Service müşteriye "Kargonuz yola çıktı" maili atabilir.
-		// Şimdilik sadece DB güncelliyoruz.)
+		fmt.Printf("📦 Sipariş #%s durumu: %s → %s\n", id, oldStatus, req.Status)
 
-		return c.JSON(fiber.Map{"message": "Durum güncellendi", "order": order})
+		return c.JSON(fiber.Map{
+			"message": "Durum güncellendi",
+			"order":   order,
+		})
 	})
 
 	log.Fatal(app.Listen(":3004"))
