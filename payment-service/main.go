@@ -18,6 +18,19 @@ type PaymentRequest struct {
 func main() {
 	app := fiber.New()
 
+	// ==============================================================================
+	// HEALTH CHECK ENDPOINT
+	// ==============================================================================
+	app.Get("/health", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"status":  "healthy",
+			"service": "payment-service",
+			"checks": fiber.Map{
+				"self": fiber.Map{"status": "healthy", "message": "service is running"},
+			},
+		})
+	})
+
 	app.Post("/pay", func(c *fiber.Ctx) error {
 		var req PaymentRequest
 		if err := c.BodyParser(&req); err != nil {

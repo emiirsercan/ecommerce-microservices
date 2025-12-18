@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -14,6 +15,13 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
+
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
 
 // ==============================================================================
 // VERİTABANI MODELLERİ
@@ -125,11 +133,27 @@ var ch *amqp.Channel
 // ==============================================================================
 
 func initDatabase() {
-	dsn := "host=localhost user=user password=password dbname=ecommerce port=5432 sslmode=disable"
+	dbHost := getEnv("DB_HOST", "localhost")
+	dbUser := getEnv("DB_USER", "user")
+	dbPass := getEnv("DB_PASSWORD", "password")
+	dbName := getEnv("DB_NAME", "ecommerce")
+	dbPort := getEnv("DB_PORT", "5432")
+
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable", dbHost, dbUser, dbPass, dbName, dbPort)
+
+	// PostgreSQL bağlantısı için retry mantığı
 	var err error
-	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	maxRetries := 30
+	for i := 0; i < maxRetries; i++ {
+		DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+		if err == nil {
+			break
+		}
+		log.Printf("⏳ PostgreSQL bağlantı bekleniyor... (%d/%d)", i+1, maxRetries)
+		time.Sleep(2 * time.Second)
+	}
 	if err != nil {
-		log.Fatal("❌ Order Service DB Hatası:", err)
+		log.Fatal("❌ Order Service PostgreSQL'e bağlanılamadı:", err)
 	}
 
 	/*
@@ -144,7 +168,7 @@ func initDatabase() {
 	   Production'da: Flyway, Goose gibi migration tool'ları kullan
 	*/
 	DB.AutoMigrate(&Order{}, &OrderItem{})
-	fmt.Println("🚀 Order Service Veritabanına Bağlandı!")
+	fmt.Println("✅ Order Service Veritabanına Bağlandı!")
 }
 
 func failOnError(err error, msg string) {
@@ -156,9 +180,24 @@ func failOnError(err error, msg string) {
 func main() {
 	initDatabase()
 
-	// RabbitMQ Bağlantısı
-	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
-	failOnError(err, "RabbitMQ'ya bağlanılamadı")
+	// RabbitMQ Bağlantısı (RETRY İLE)
+	rabbitURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+
+	var conn *amqp.Connection
+	var err error
+	maxRetries := 30
+	for i := 0; i < maxRetries; i++ {
+		conn, err = amqp.Dial(rabbitURL)
+		if err == nil {
+			break
+		}
+		log.Printf("⏳ RabbitMQ bağlantı bekleniyor... (%d/%d)", i+1, maxRetries)
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		log.Fatalf("❌ RabbitMQ'ya bağlanılamadı: %s", err)
+	}
+	fmt.Println("✅ RabbitMQ Bağlantısı Başarılı!")
 	defer conn.Close()
 
 	ch, err = conn.Channel()
@@ -185,6 +224,46 @@ func main() {
 		AllowMethods: "GET, POST, HEAD, PUT, DELETE, PATCH, OPTIONS",
 	}))
 
+	// ==============================================================================
+	// HEALTH CHECK ENDPOINT
+	// ==============================================================================
+	app.Get("/health", func(c *fiber.Ctx) error {
+		checks := make(map[string]interface{})
+		status := "healthy"
+
+		// PostgreSQL kontrolü
+		sqlDB, err := DB.DB()
+		if err != nil {
+			checks["postgres"] = map[string]string{"status": "unhealthy", "message": err.Error()}
+			status = "unhealthy"
+		} else if err := sqlDB.Ping(); err != nil {
+			checks["postgres"] = map[string]string{"status": "unhealthy", "message": err.Error()}
+			status = "unhealthy"
+		} else {
+			checks["postgres"] = map[string]string{"status": "healthy", "message": "connection OK"}
+		}
+
+		// RabbitMQ kontrolü
+		if ch == nil {
+			checks["rabbitmq"] = map[string]string{"status": "unhealthy", "message": "channel is nil"}
+			status = "unhealthy"
+		} else {
+			checks["rabbitmq"] = map[string]string{"status": "healthy", "message": "connection OK"}
+		}
+
+		statusCode := 200
+		if status != "healthy" {
+			statusCode = 503
+		}
+
+		return c.Status(statusCode).JSON(fiber.Map{
+			"status":    status,
+			"service":   "order-service",
+			"timestamp": time.Now().Format(time.RFC3339),
+			"checks":    checks,
+		})
+	})
+
 	// ==========================================================================
 	// ENDPOINT 1: SİPARİŞ OLUŞTUR (POST /orders)
 	// ==========================================================================
@@ -201,6 +280,9 @@ func main() {
 	      DB.Transaction(func(tx *gorm.DB) error { ... })
 	*/
 	app.Post("/orders", func(c *fiber.Ctx) error {
+		productServiceURL := getEnv("PRODUCT_SERVICE_URL", "http://localhost:3001")
+		paymentServiceURL := getEnv("PAYMENT_SERVICE_URL", "http://localhost:3005")
+
 		req := new(CreateOrderRequest)
 		if err := c.BodyParser(req); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "Hatalı veri formatı"})
@@ -212,7 +294,7 @@ func main() {
 		}
 		stockJSON, _ := json.Marshal(stockCheckData)
 
-		stockRes, err := http.Post("http://localhost:3001/products/validate", "application/json", bytes.NewBuffer(stockJSON))
+		stockRes, err := http.Post(productServiceURL+"/products/validate", "application/json", bytes.NewBuffer(stockJSON))
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Ürün servisine ulaşılamadı"})
 		}
@@ -234,7 +316,7 @@ func main() {
 		}
 		paymentJSON, _ := json.Marshal(paymentData)
 
-		paymentRes, err := http.Post("http://localhost:3005/pay", "application/json", bytes.NewBuffer(paymentJSON))
+		paymentRes, err := http.Post(paymentServiceURL+"/pay", "application/json", bytes.NewBuffer(paymentJSON))
 		if err != nil || paymentRes.StatusCode != 200 {
 			return c.Status(400).JSON(fiber.Map{"error": "Ödeme reddedildi!"})
 		}
@@ -336,24 +418,35 @@ func main() {
 		}
 		offset := (page - 1) * limit
 
-		query := DB.Model(&Order{}).Preload("Items")
+		// Base query oluştur (filtreler dahil)
+		baseQuery := DB.Model(&Order{})
 
 		// Durum filtresi: ?status=Hazırlanıyor
 		if status := c.Query("status"); status != "" {
-			query = query.Where("status = ?", status)
+			baseQuery = baseQuery.Where("status = ?", status)
 		}
 
 		// Kullanıcı filtresi: ?user_id=5
 		if userID := c.Query("user_id"); userID != "" {
-			query = query.Where("user_id = ?", userID)
+			baseQuery = baseQuery.Where("user_id = ?", userID)
 		}
 
-		// Toplam sayıyı hesapla
-		query.Count(&totalItems)
+		// Toplam sayıyı hesapla (AYRI QUERY - State pollution'ı önlemek için)
+		baseQuery.Count(&totalItems)
 
-		// Sıralama ve pagination uygula
-		result := query.Order("created_at desc").Offset(offset).Limit(limit).Find(&orders)
-		if result.Error != nil {
+		// Sıralama ve pagination uygula (YENİ QUERY)
+		result := DB.Model(&Order{}).Preload("Items")
+
+		// Filtreleri tekrar uygula
+		if status := c.Query("status"); status != "" {
+			result = result.Where("status = ?", status)
+		}
+		if userID := c.Query("user_id"); userID != "" {
+			result = result.Where("user_id = ?", userID)
+		}
+
+		// Pagination ve sıralama
+		if err := result.Order("created_at desc").Offset(offset).Limit(limit).Find(&orders).Error; err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Siparişler çekilemedi"})
 		}
 

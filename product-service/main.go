@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"time"
 
@@ -23,6 +24,13 @@ var DB *gorm.DB
 var ch *amqp.Channel
 
 const SecretKey = "benim_cok_gizli_anahtarim_senior_oluyorum"
+
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
 
 // --- METRİKLER ---
 var (
@@ -72,13 +80,29 @@ type OrderEvent struct {
 }
 
 func initDatabase() {
+	dbHost := getEnv("DB_HOST", "localhost")
+	dbUser := getEnv("DB_USER", "user")
+	dbPass := getEnv("DB_PASSWORD", "password")
+	dbName := getEnv("DB_NAME", "ecommerce")
+	dbPort := getEnv("DB_PORT", "5432")
+
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable", dbHost, dbUser, dbPass, dbName, dbPort)
+
+	// PostgreSQL bağlantısı için retry mantığı
 	var err error
-	dsn := "host=localhost user=user password=password dbname=ecommerce port=5432 sslmode=disable"
-	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
-	if err != nil {
-		log.Fatal("DB Hatası: ", err)
+	maxRetries := 30
+	for i := 0; i < maxRetries; i++ {
+		DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+		if err == nil {
+			break
+		}
+		log.Printf("⏳ PostgreSQL bağlantı bekleniyor... (%d/%d)", i+1, maxRetries)
+		time.Sleep(2 * time.Second)
 	}
-	fmt.Println("🚀 Product DB Bağlandı!")
+	if err != nil {
+		log.Fatal("❌ PostgreSQL'e bağlanılamadı: ", err)
+	}
+	fmt.Println("✅ Product DB Bağlandı!")
 
 	// Önce Category, sonra Product (Foreign Key ilişkisi için)
 	DB.AutoMigrate(&Category{}, &Product{})
@@ -117,9 +141,24 @@ func failOnError(err error, msg string) {
 func main() {
 	initDatabase()
 
-	// --- RABBITMQ BAĞLANTISI ---
-	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
-	failOnError(err, "RabbitMQ'ya bağlanılamadı")
+	// --- RABBITMQ BAĞLANTISI (RETRY İLE) ---
+	rabbitURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+
+	var conn *amqp.Connection
+	var err error
+	maxRetries := 30
+	for i := 0; i < maxRetries; i++ {
+		conn, err = amqp.Dial(rabbitURL)
+		if err == nil {
+			break
+		}
+		log.Printf("⏳ RabbitMQ bağlantı bekleniyor... (%d/%d)", i+1, maxRetries)
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		log.Fatalf("❌ RabbitMQ'ya bağlanılamadı: %s", err)
+	}
+	fmt.Println("✅ RabbitMQ Bağlantısı Başarılı!")
 	defer conn.Close()
 
 	ch, err = conn.Channel()
@@ -189,6 +228,46 @@ func main() {
 		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
 		AllowMethods: "GET, POST, HEAD, PUT, DELETE, PATCH, OPTIONS",
 	}))
+
+	// ==============================================================================
+	// HEALTH CHECK ENDPOINT
+	// ==============================================================================
+	app.Get("/health", func(c *fiber.Ctx) error {
+		checks := make(map[string]interface{})
+		status := "healthy"
+
+		// PostgreSQL kontrolü
+		sqlDB, err := DB.DB()
+		if err != nil {
+			checks["postgres"] = map[string]string{"status": "unhealthy", "message": err.Error()}
+			status = "unhealthy"
+		} else if err := sqlDB.Ping(); err != nil {
+			checks["postgres"] = map[string]string{"status": "unhealthy", "message": err.Error()}
+			status = "unhealthy"
+		} else {
+			checks["postgres"] = map[string]string{"status": "healthy", "message": "connection OK"}
+		}
+
+		// RabbitMQ kontrolü
+		if ch == nil {
+			checks["rabbitmq"] = map[string]string{"status": "unhealthy", "message": "channel is nil"}
+			status = "unhealthy"
+		} else {
+			checks["rabbitmq"] = map[string]string{"status": "healthy", "message": "connection OK"}
+		}
+
+		statusCode := 200
+		if status != "healthy" {
+			statusCode = 503
+		}
+
+		return c.Status(statusCode).JSON(fiber.Map{
+			"status":    status,
+			"service":   "product-service",
+			"timestamp": time.Now().Format(time.RFC3339),
+			"checks":    checks,
+		})
+	})
 
 	// =====================
 	// KATEGORİ ENDPOINT'LERİ
@@ -287,86 +366,64 @@ func main() {
 		offset := (page - 1) * limit
 
 		// =================================================================
-		// 2. FİLTRELEME
+		// 2. FİLTRELEME (Count için)
 		// =================================================================
-		query := DB.Model(&Product{}).Preload("Category")
-
-		// ?category=5 → Kategoriye göre filtrele
-		if categoryID := c.Query("category"); categoryID != "" {
-			query = query.Where("category_id = ?", categoryID)
+		// Helper: Filtreleri bir query'ye uygula
+		applyFilters := func(q *gorm.DB) *gorm.DB {
+			// ?category=5 → Kategoriye göre filtrele
+			if categoryID := c.Query("category"); categoryID != "" {
+				q = q.Where("category_id = ?", categoryID)
+			}
+			// ?min=100&max=500 → Fiyat aralığı
+			if minPrice := c.Query("min"); minPrice != "" {
+				q = q.Where("price >= ?", minPrice)
+			}
+			if maxPrice := c.Query("max"); maxPrice != "" {
+				q = q.Where("price <= ?", maxPrice)
+			}
+			// ?stock=true → Sadece stokta olanlar
+			if inStock := c.Query("stock"); inStock == "true" {
+				q = q.Where("stock > 0")
+			}
+			// ?search=iphone → İsimde ara
+			if search := c.Query("search"); search != "" {
+				q = q.Where("name ILIKE ?", "%"+search+"%")
+			}
+			return q
 		}
 
-		// ?min=100&max=500 → Fiyat aralığı
-		if minPrice := c.Query("min"); minPrice != "" {
-			query = query.Where("price >= ?", minPrice)
-		}
-		if maxPrice := c.Query("max"); maxPrice != "" {
-			query = query.Where("price <= ?", maxPrice)
-		}
-
-		// ?stock=true → Sadece stokta olanlar
-		if inStock := c.Query("stock"); inStock == "true" {
-			query = query.Where("stock > 0")
-		}
-
-		// ?search=iphone → İsimde ara
-		if search := c.Query("search"); search != "" {
-			query = query.Where("name ILIKE ?", "%"+search+"%")
-		}
+		// =================================================================
+		// 3. TOPLAM SAYIYI HESAPLA (AYRI QUERY)
+		// =================================================================
+		countQuery := applyFilters(DB.Model(&Product{}))
+		countQuery.Count(&totalItems)
 
 		// =================================================================
-		// 3. TOPLAM SAYIYI HESAPLA (Pagination için gerekli)
+		// 4. VERİYİ ÇEK (YENİ QUERY)
 		// =================================================================
-		/*
-		   Count(): Filtrelere uyan toplam kayıt sayısı
-		   Bu değer pagination UI için gerekli:
-		   - "150 ürün bulundu"
-		   - "Toplam 8 sayfa"
-		*/
-		query.Count(&totalItems)
+		dataQuery := applyFilters(DB.Model(&Product{}).Preload("Category"))
 
-		// =================================================================
-		// 4. SIRALAMA
-		// =================================================================
+		// Sıralama
 		sort := c.Query("sort")
 		switch sort {
 		case "price_asc":
-			query = query.Order("price ASC")
+			dataQuery = dataQuery.Order("price ASC")
 		case "price_desc":
-			query = query.Order("price DESC")
+			dataQuery = dataQuery.Order("price DESC")
 		case "newest":
-			query = query.Order("created_at DESC")
+			dataQuery = dataQuery.Order("created_at DESC")
 		case "oldest":
-			query = query.Order("created_at ASC")
+			dataQuery = dataQuery.Order("created_at ASC")
 		default:
-			query = query.Order("created_at DESC")
+			dataQuery = dataQuery.Order("created_at DESC")
 		}
 
-		// =================================================================
-		// 5. PAGİNATİON UYGULA VE VERİYİ ÇEK
-		// =================================================================
-		/*
-		   Offset(offset): Kaç kayıt atlanacak
-		   Limit(limit): Kaç kayıt alınacak
-
-		   SQL Karşılığı:
-		   SELECT * FROM products
-		   WHERE ... (filtreler)
-		   ORDER BY created_at DESC
-		   LIMIT 20 OFFSET 40
-		*/
-		query.Offset(offset).Limit(limit).Find(&products)
+		// Pagination uygula
+		dataQuery.Offset(offset).Limit(limit).Find(&products)
 
 		// =================================================================
-		// 6. PAGİNATİON META VERİSİ HESAPLA
+		// 5. PAGİNATİON META VERİSİ HESAPLA
 		// =================================================================
-		/*
-		   totalPages hesaplama:
-		   totalItems=150, limit=20 → 150/20 = 7.5 → 8 sayfa
-
-		   Ceiling (yukarı yuvarlama) için:
-		   (150 + 20 - 1) / 20 = 169 / 20 = 8
-		*/
 		totalPages := int64(0)
 		if totalItems > 0 {
 			totalPages = (totalItems + int64(limit) - 1) / int64(limit)
@@ -376,7 +433,7 @@ func main() {
 		hasPrev := page > 1
 
 		// =================================================================
-		// 7. RESPONSE
+		// 6. RESPONSE
 		// =================================================================
 		return c.JSON(fiber.Map{
 			"products": products, // Frontend "products" bekliyor

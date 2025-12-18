@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"time"
 
 	"github.com/streadway/amqp"
 )
@@ -15,6 +17,13 @@ type OrderEvent struct {
 	TotalPrice int   `json:"total_price"`
 }
 
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
+
 func failOnError(err error, msg string) {
 	if err != nil {
 		log.Fatalf("%s: %s", msg, err)
@@ -22,9 +31,24 @@ func failOnError(err error, msg string) {
 }
 
 func main() {
-	// 1. RabbitMQ'ya Bağlan (Order Service ile aynı adres)
-	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
-	failOnError(err, "RabbitMQ'ya bağlanılamadı")
+	// 1. RabbitMQ'ya Bağlan (RETRY İLE)
+	rabbitURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+
+	var conn *amqp.Connection
+	var err error
+	maxRetries := 30
+	for i := 0; i < maxRetries; i++ {
+		conn, err = amqp.Dial(rabbitURL)
+		if err == nil {
+			break
+		}
+		log.Printf("⏳ RabbitMQ bağlantı bekleniyor... (%d/%d)", i+1, maxRetries)
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		log.Fatalf("❌ RabbitMQ'ya bağlanılamadı: %s", err)
+	}
+	fmt.Println("✅ RabbitMQ Bağlantısı Başarılı!")
 	defer conn.Close()
 
 	ch, err := conn.Channel()

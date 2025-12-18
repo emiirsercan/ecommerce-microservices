@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -18,18 +19,40 @@ import (
 
 var DB *gorm.DB
 
-func initDatabase() {
-	dsn := "host=localhost user=user password=password dbname=ecommerce port=5432 sslmode=disable"
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
 
+func initDatabase() {
+	dbHost := getEnv("DB_HOST", "localhost")
+	dbUser := getEnv("DB_USER", "user")
+	dbPass := getEnv("DB_PASSWORD", "password")
+	dbName := getEnv("DB_NAME", "ecommerce")
+	dbPort := getEnv("DB_PORT", "5432")
+
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable", dbHost, dbUser, dbPass, dbName, dbPort)
+
+	// PostgreSQL bağlantısı için retry mantığı
 	var err error
-	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	maxRetries := 30
+	for i := 0; i < maxRetries; i++ {
+		DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+		if err == nil {
+			break
+		}
+		log.Printf("⏳ PostgreSQL bağlantı bekleniyor... (%d/%d)", i+1, maxRetries)
+		time.Sleep(2 * time.Second)
+	}
 	if err != nil {
-		log.Fatal("❌ Veritabanına bağlanılamadı:", err)
+		log.Fatal("❌ Coupon Service PostgreSQL'e bağlanılamadı:", err)
 	}
 
 	DB.AutoMigrate(&Coupon{}, &CouponUsage{})
 
-	fmt.Println("🎟️ Coupon Service Veritabanına Bağlandı!")
+	fmt.Println("✅ Coupon Service Veritabanına Bağlandı!")
 
 	// Örnek kuponları oluştur (Demo için)
 	seedCoupons()
@@ -243,6 +266,38 @@ func main() {
 		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
 		AllowMethods: "GET, POST, PUT, DELETE, PATCH, OPTIONS",
 	}))
+
+	// ==============================================================================
+	// HEALTH CHECK ENDPOINT
+	// ==============================================================================
+	app.Get("/health", func(c *fiber.Ctx) error {
+		checks := make(map[string]interface{})
+		status := "healthy"
+
+		// PostgreSQL kontrolü
+		sqlDB, err := DB.DB()
+		if err != nil {
+			checks["postgres"] = map[string]string{"status": "unhealthy", "message": err.Error()}
+			status = "unhealthy"
+		} else if err := sqlDB.Ping(); err != nil {
+			checks["postgres"] = map[string]string{"status": "unhealthy", "message": err.Error()}
+			status = "unhealthy"
+		} else {
+			checks["postgres"] = map[string]string{"status": "healthy", "message": "connection OK"}
+		}
+
+		statusCode := 200
+		if status != "healthy" {
+			statusCode = 503
+		}
+
+		return c.Status(statusCode).JSON(fiber.Map{
+			"status":    status,
+			"service":   "coupon-service",
+			"timestamp": time.Now().Format(time.RFC3339),
+			"checks":    checks,
+		})
+	})
 
 	// --- 1. TÜM KUPONLARI LİSTELE (Admin için) - PAGİNATİON ---
 	/*

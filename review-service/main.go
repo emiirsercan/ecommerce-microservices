@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -26,22 +27,29 @@ type Review struct {
 }
 
 var collection *mongo.Collection
+var mongoClient *mongo.Client
+
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
 
 func initMongo() {
 	// MongoDB Bağlantı Cümlesi (Docker içindeki isme göre)
-	// Localhost yerine "mongo" kullanacağız (Docker ağı içinde konuşacakları için)
-	// Ama sen şimdilik "go run" ile dışarıdan çalıştıracaksan "localhost" kullanmalısın.
-	// Prod ortamında bu ENV variable ile yönetilir.
-	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
+	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
+	clientOptions := options.Client().ApplyURI(mongoURI)
 
 	// Bağlan
-	client, err := mongo.Connect(context.TODO(), clientOptions)
+	var err error
+	mongoClient, err = mongo.Connect(context.TODO(), clientOptions)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// Bağlantıyı Test Et (Ping)
-	err = client.Ping(context.TODO(), nil)
+	err = mongoClient.Ping(context.TODO(), nil)
 	if err != nil {
 		log.Fatal("MongoDB'ye ulaşılamadı:", err)
 	}
@@ -49,7 +57,7 @@ func initMongo() {
 	fmt.Println("🚀 MongoDB Bağlantısı Başarılı!")
 
 	// Veritabanı: ecommerce, Koleksiyon: reviews
-	collection = client.Database("ecommerce").Collection("reviews")
+	collection = mongoClient.Database("ecommerce").Collection("reviews")
 }
 
 func main() {
@@ -61,6 +69,35 @@ func main() {
 		AllowHeaders: "*",
 		AllowMethods: "*",
 	}))
+
+	// ==============================================================================
+	// HEALTH CHECK ENDPOINT
+	// ==============================================================================
+	app.Get("/health", func(c *fiber.Ctx) error {
+		checks := make(map[string]interface{})
+		status := "healthy"
+
+		// MongoDB kontrolü
+		err := mongoClient.Ping(context.TODO(), nil)
+		if err != nil {
+			checks["mongodb"] = map[string]string{"status": "unhealthy", "message": err.Error()}
+			status = "unhealthy"
+		} else {
+			checks["mongodb"] = map[string]string{"status": "healthy", "message": "connection OK"}
+		}
+
+		statusCode := 200
+		if status != "healthy" {
+			statusCode = 503
+		}
+
+		return c.Status(statusCode).JSON(fiber.Map{
+			"status":    status,
+			"service":   "review-service",
+			"timestamp": time.Now().Format(time.RFC3339),
+			"checks":    checks,
+		})
+	})
 
 	// 1. Yorum Ekle (POST)
 	app.Post("/reviews", func(c *fiber.Ctx) error {

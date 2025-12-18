@@ -1,79 +1,420 @@
+version: '3.8'
+
 services:
-  
-  mongo:
-    image: mongo:latest
-    container_name: ecommerce_mongo
-    ports:
-      - "27017:27017" # MongoDB'nin standart portu
-    volumes:
-      - mongo_data:/data/db # Veriler kaybolmasın
-    networks:
-      - ecommerce_net
+  # ==============================================================================
+  # DATABASES & INFRASTRUCTURE
+  # ==============================================================================
 
-  prometheus:
-    image: prom/prometheus
-    container_name: ecommerce_prometheus
-    volumes:
-      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml
-    ports:
-      - "9090:9090"
-    networks:
-      - ecommerce_net
-
-  grafana:
-    image: grafana/grafana
-    container_name: ecommerce_grafana
-    ports:
-      - "3007:3000" # Frontend (3000) ile çakışmasın diye 3001 yaptık
-    networks:
-      - ecommerce_net
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
-    container_name: ecommerce_elastic
-    environment:
-      - discovery.type=single-node
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m" # RAM'i sömürmesin diye limit koyuyoruz
-    ports:
-      - "9200:9200"
-    networks:
-      - ecommerce_net
-  # 1. PostgreSQL Veritabanı
+  # --- POSTGRESQL ---
+  # pg_isready: PostgreSQL'in yerleşik sağlık kontrol aracı
+  # -U user: Kullanıcı adı ile kontrol
+  # -d ecommerce: Veritabanı adı ile kontrol
   postgres:
     image: postgres:15-alpine
-    container_name: ecommerce_db
+    container_name: postgres
     environment:
       POSTGRES_USER: user
-      POSTGRES_PASSWORD: password 
+      POSTGRES_PASSWORD: password
       POSTGRES_DB: ecommerce
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
-      - ecommerce_net
+      - ecommerce-network
+    healthcheck:
+      # pg_isready: PostgreSQL connection check tool
+      test: [ "CMD-SHELL", "pg_isready -U user -d ecommerce" ]
+      interval: 10s # Her 10 saniyede bir kontrol
+      timeout: 5s # 5 saniye içinde cevap gelmezse fail
+      retries: 5 # 5 başarısız deneme = unhealthy
+      start_period: 30s # İlk 30 saniye kontrol etme (startup süresi)
 
-  # 2. Redis Cache
+  # --- RABBITMQ ---
+  # rabbitmq-diagnostics ping: RabbitMQ broker'ının çalışıp çalışmadığını kontrol eder
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - ecommerce-network
+    healthcheck:
+      # rabbitmq-diagnostics: RabbitMQ'nun diagnostik aracı
+      # -q: quiet mode (sadece exit code döner)
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s # RabbitMQ yavaş başlar, 60 saniye bekle
+
+  # --- REDIS ---
+  # redis-cli ping: Redis'e PING gönderir, PONG dönerse sağlıklı
   redis:
     image: redis:alpine
-    container_name: ecommerce_redis
+    container_name: redis
     ports:
       - "6379:6379"
     networks:
-      - ecommerce_net
-  rabbitmq:
-    image: rabbitmq:3-management-alpine
-    container_name: ecommerce_rabbitmq
+      - ecommerce-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # --- ELASTICSEARCH ---
+  # curl ile cluster health endpoint'ini kontrol eder
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
     ports:
-      - "5672:5672"   # Mesajlaşma portu (Servisler buraya konuşur)
-      - "15672:15672" # Yönetim paneli (Tarayıcıdan gireceğiz)
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
     networks:
-      - ecommerce_net
-# Verilerin kaybolmaması için Volume tanımı
+      - ecommerce-network
+    healthcheck:
+      # Elasticsearch cluster health API
+      # grep ile "green\|yellow" kontrol (red değilse OK)
+      test: [ "CMD-SHELL", "curl -s http://127.0.0.1:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s # Elasticsearch yavaş başlar
+
+  # --- MONGODB ---
+  # mongosh ile ping komutu çalıştırır
+  mongo:
+    image: mongo:latest
+    container_name: mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - ecommerce-network
+    healthcheck:
+      # mongosh: MongoDB shell
+      # db.runCommand('ping').ok: 1 dönerse sağlıklı
+      test: [ "CMD", "mongosh", "--eval", "db.runCommand('ping').ok", "--quiet" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ==============================================================================
+  # MICROSERVICES
+  # ==============================================================================
+
+  # --- API GATEWAY ---
+  # Tüm servislerin önündeki kapı
+  # depends_on + condition: Bağımlılıklar HEALTHY olana kadar bekler
+  api-gateway:
+    build:
+      context: .
+      dockerfile: ./api-gateway/Dockerfile
+    container_name: api-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - AUTH_SERVICE_URL=http://auth-service:3002
+      - PRODUCT_SERVICE_URL=http://product-service:3001
+      - CART_SERVICE_URL=http://cart-service:3003
+      - ORDER_SERVICE_URL=http://order-service:3004
+      - PAYMENT_SERVICE_URL=http://payment-service:3005
+      - SEARCH_SERVICE_URL=http://search-service:3006
+      - REVIEW_SERVICE_URL=http://review-service:3008
+      - WISHLIST_SERVICE_URL=http://wishlist-service:3009
+      - COUPON_SERVICE_URL=http://coupon-service:3010
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      product-service:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # --- AUTH SERVICE ---
+  auth-service:
+    build:
+      context: .
+      dockerfile: ./auth-service/Dockerfile
+    container_name: auth-service
+    ports:
+      - "3002:3002"
+    environment:
+      - DB_HOST=postgres
+      - DB_USER=user
+      - DB_PASSWORD=password
+      - DB_NAME=ecommerce
+      - DB_PORT=5432
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://127.0.0.1:3002/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # --- PRODUCT SERVICE ---
+  product-service:
+    build:
+      context: .
+      dockerfile: ./product-service/Dockerfile
+    container_name: product-service
+    ports:
+      - "3001:3001"
+    environment:
+      - DB_HOST=postgres
+      - DB_USER=user
+      - DB_PASSWORD=password
+      - DB_NAME=ecommerce
+      - DB_PORT=5432
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://127.0.0.1:3001/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # --- CART SERVICE ---
+  cart-service:
+    build:
+      context: .
+      dockerfile: ./cart-service/Dockerfile
+    container_name: cart-service
+    ports:
+      - "3003:3003"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://127.0.0.1:3003/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # --- ORDER SERVICE ---
+  order-service:
+    build:
+      context: .
+      dockerfile: ./order-service/Dockerfile
+    container_name: order-service
+    ports:
+      - "3004:3004"
+    environment:
+      - DB_HOST=postgres
+      - DB_USER=user
+      - DB_PASSWORD=password
+      - DB_NAME=ecommerce
+      - DB_PORT=5432
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - PRODUCT_SERVICE_URL=http://product-service:3001
+      - PAYMENT_SERVICE_URL=http://payment-service:3005
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      product-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://127.0.0.1:3004/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # --- SEARCH SERVICE ---
+  search-service:
+    build:
+      context: .
+      dockerfile: ./search-service/Dockerfile
+    container_name: search-service
+    ports:
+      - "3006:3006"
+    environment:
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - PRODUCT_SERVICE_URL=http://product-service:3001
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      product-service:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://127.0.0.1:3006/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # --- REVIEW SERVICE ---
+  review-service:
+    build:
+      context: .
+      dockerfile: ./review-service/Dockerfile
+    container_name: review-service
+    ports:
+      - "3008:3008"
+    environment:
+      - MONGO_URI=mongodb://mongo:27017
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://127.0.0.1:3008/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # --- WISHLIST SERVICE ---
+  wishlist-service:
+    build:
+      context: .
+      dockerfile: ./wishlist-service/Dockerfile
+    container_name: wishlist-service
+    ports:
+      - "3009:3009"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://127.0.0.1:3009/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # --- COUPON SERVICE ---
+  coupon-service:
+    build:
+      context: .
+      dockerfile: ./coupon-service/Dockerfile
+    container_name: coupon-service
+    ports:
+      - "3010:3010"
+    environment:
+      - DB_HOST=postgres
+      - DB_USER=user
+      - DB_PASSWORD=password
+      - DB_NAME=ecommerce
+      - DB_PORT=5432
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://127.0.0.1:3010/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # --- NOTIFICATION SERVICE ---
+  # Background worker (HTTP server yok, healthcheck yok)
+  notification-service:
+    build:
+      context: .
+      dockerfile: ./notification-service/Dockerfile
+    container_name: notification-service
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  # --- PAYMENT SERVICE ---
+  payment-service:
+    build:
+      context: .
+      dockerfile: ./payment-service/Dockerfile
+    container_name: payment-service
+    ports:
+      - "3005:3005"
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://127.0.0.1:3005/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ==============================================================================
+  # FRONTEND
+  # ==============================================================================
+  client:
+    build: ./client
+    container_name: client
+    ports:
+      - "3000:3000"
+    environment:
+      - API_URL=http://api-gateway:8080
+      - NEXT_PUBLIC_API_URL=http://127.0.0.1:8080
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+networks:
+  ecommerce-network:
+    driver: bridge
+
 volumes:
   postgres_data:
   mongo_data:
-
-# Ağ Tanımı (Hatanın sebebi burasının eksik olmasıydı)
-networks:
-  ecommerce_net:
-    driver: bridge
+  es_data:

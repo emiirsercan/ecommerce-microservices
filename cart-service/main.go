@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strconv" // String çevirmek için lazım
+	"time"
 
 	jwtware "github.com/gofiber/contrib/jwt"
 	"github.com/gofiber/fiber/v2"
@@ -19,6 +21,13 @@ const SecretKey = "benim_cok_gizli_anahtarim_senior_oluyorum"
 var ctx = context.Background()
 var rdb *redis.Client
 
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
+
 type CartItem struct {
 	ProductID int `json:"product_id"`
 	Quantity  int `json:"quantity"`
@@ -26,8 +35,10 @@ type CartItem struct {
 
 // Redis Bağlantısı
 func initRedis() {
+	redisHost := getEnv("REDIS_HOST", "localhost")
+	redisPort := getEnv("REDIS_PORT", "6379")
 	rdb = redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr: fmt.Sprintf("%s:%s", redisHost, redisPort),
 	})
 	if _, err := rdb.Ping(ctx).Result(); err != nil {
 		log.Fatal("Redis'e bağlanılamadı:", err)
@@ -44,6 +55,35 @@ func main() {
 		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
 		AllowMethods: "GET, POST, HEAD, PUT, DELETE, PATCH, OPTIONS",
 	}))
+
+	// ==============================================================================
+	// HEALTH CHECK ENDPOINT (JWT'den ÖNCE - public olmalı)
+	// ==============================================================================
+	app.Get("/health", func(c *fiber.Ctx) error {
+		checks := make(map[string]interface{})
+		status := "healthy"
+
+		// Redis kontrolü
+		_, err := rdb.Ping(ctx).Result()
+		if err != nil {
+			checks["redis"] = map[string]string{"status": "unhealthy", "message": err.Error()}
+			status = "unhealthy"
+		} else {
+			checks["redis"] = map[string]string{"status": "healthy", "message": "connection OK"}
+		}
+
+		statusCode := 200
+		if status != "healthy" {
+			statusCode = 503
+		}
+
+		return c.Status(statusCode).JSON(fiber.Map{
+			"status":    status,
+			"service":   "cart-service",
+			"timestamp": time.Now().Format(time.RFC3339),
+			"checks":    checks,
+		})
+	})
 
 	// ==========================================================================
 	// JWT MIDDLEWARE - Tüm endpoint'ler için token gerekli!

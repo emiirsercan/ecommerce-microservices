@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -15,6 +16,13 @@ import (
 	"github.com/olivere/elastic/v7"
 	"github.com/streadway/amqp"
 )
+
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
 
 type ProductIndex struct {
 	ID         int    `json:"ID"`
@@ -30,11 +38,12 @@ var ctx = context.Background()
 
 func initElastic() {
 	var err error
+	elasticURL := getEnv("ELASTICSEARCH_URL", "http://localhost:9200")
 
 	// Elasticsearch bağlantısını bekle (Docker başlaması zaman alabilir)
 	for i := 0; i < 10; i++ {
 		client, err = elastic.NewClient(
-			elastic.SetURL("http://localhost:9200"),
+			elastic.SetURL(elasticURL),
 			elastic.SetSniff(false),
 			elastic.SetHealthcheck(false),
 		)
@@ -103,9 +112,10 @@ func ensureIndex() {
 // Product Service'den tüm ürünleri çekip Elasticsearch'e yazar
 func syncProductsFromDB() {
 	fmt.Println("🔄 Başlangıç senkronizasyonu başlatılıyor...")
+	productServiceURL := getEnv("PRODUCT_SERVICE_URL", "http://localhost:3001")
 
 	// Product Service'den ürünleri çek (limit=1000 ile tüm ürünleri al)
-	resp, err := http.Get("http://localhost:3001/products?limit=1000")
+	resp, err := http.Get(productServiceURL + "/products?limit=1000")
 	if err != nil {
 		fmt.Println("⚠️ Product Service'e ulaşılamadı:", err)
 		fmt.Println("   (Product Service çalışıyor mu?)")
@@ -166,9 +176,24 @@ func main() {
 		syncProductsFromDB()
 	}()
 
-	// --- RABBITMQ BAĞLANTISI ---
-	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
-	failOnError(err, "RabbitMQ'ya bağlanılamadı")
+	// --- RABBITMQ BAĞLANTISI (RETRY İLE) ---
+	rabbitURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+
+	var conn *amqp.Connection
+	var err error
+	maxRetries := 30
+	for i := 0; i < maxRetries; i++ {
+		conn, err = amqp.Dial(rabbitURL)
+		if err == nil {
+			break
+		}
+		log.Printf("⏳ RabbitMQ bağlantı bekleniyor... (%d/%d)", i+1, maxRetries)
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		log.Fatalf("❌ RabbitMQ'ya bağlanılamadı: %s", err)
+	}
+	fmt.Println("✅ RabbitMQ Bağlantısı Başarılı!")
 	defer conn.Close()
 
 	ch, err := conn.Channel()
@@ -213,6 +238,35 @@ func main() {
 		AllowOrigins: "*",
 		AllowHeaders: "*",
 	}))
+
+	// ==============================================================================
+	// HEALTH CHECK ENDPOINT
+	// ==============================================================================
+	app.Get("/health", func(c *fiber.Ctx) error {
+		checks := make(map[string]interface{})
+		status := "healthy"
+
+		// Elasticsearch kontrolü
+		_, _, err := client.Ping(getEnv("ELASTICSEARCH_URL", "http://localhost:9200")).Do(ctx)
+		if err != nil {
+			checks["elasticsearch"] = map[string]string{"status": "unhealthy", "message": err.Error()}
+			status = "unhealthy"
+		} else {
+			checks["elasticsearch"] = map[string]string{"status": "healthy", "message": "connection OK"}
+		}
+
+		statusCode := 200
+		if status != "healthy" {
+			statusCode = 503
+		}
+
+		return c.Status(statusCode).JSON(fiber.Map{
+			"status":    status,
+			"service":   "search-service",
+			"timestamp": time.Now().Format(time.RFC3339),
+			"checks":    checks,
+		})
+	})
 
 	// --- ANA ARAMA - PAGİNATİON DESTEKLİ ---
 	/*

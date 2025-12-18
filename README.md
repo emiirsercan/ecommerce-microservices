@@ -76,25 +76,35 @@ cp .env.example .env
 # .env dosyasını düzenle
 ```
 
-### 3. Docker Servislerini Başlat
+### 3. Docker ile Tüm Uygulamayı Başlat (Önerilen)
 ```bash
-docker-compose up -d
+docker-compose up --build
 ```
 
-Bu komut şunları başlatır:
-- PostgreSQL (5432)
-- Redis (6379)
-- RabbitMQ (5672, Panel: 15672)
-- Elasticsearch (9200)
-- Prometheus (9090)
-- Grafana (3007)
+Bu komut:
+- Tüm veritabanlarını (PostgreSQL, Redis, Mongo, Elastic)
+- Tüm mikroservisleri (Go API'leri)
+- Frontend uygulamasını (Next.js)
+tek seferde ayağa kaldırır.
 
-### 4. Go Bağımlılıklarını Yükle
+### Erişim:
+- **Frontend:** [http://localhost:3000](http://localhost:3000)
+- **API Gateway:** [http://localhost:8080](http://localhost:8080)
+
+---
+
+### Alternatif: Manuel Geliştirme Ortamı (Eski Yöntem)
+
+Eğer servisleri tek tek geliştirmek istiyorsanız:
+
+1. Altyapıyı Başlat:
 ```bash
-go mod download
+docker-compose -f docker-compose.infra.yml up -d
+# (Not: Sadece DB'ler için ayrı bir compose dosyası gerekebilir veya mevcut dosyadan ilgili servisleri seçebilirsiniz)
+# Örn: docker-compose up -d postgres redis rabbitmq elasticsearch mongo
 ```
 
-### 5. Servisleri Başlat (Ayrı terminallerde)
+2. Servisleri Başlat (Ayrı terminallerde):
 ```bash
 # Terminal 1 - API Gateway
 cd api-gateway && go run main.go
@@ -102,25 +112,9 @@ cd api-gateway && go run main.go
 # Terminal 2 - Auth Service
 cd auth-service && go run main.go
 
-# Terminal 3 - Product Service
-cd product-service && go run main.go
-
-# Terminal 4 - Cart Service
-cd cart-service && go run main.go
-
-# Terminal 5 - Order Service
-cd order-service && go run main.go
-
-# Terminal 6 - Search Service
-cd search-service && go run main.go
+# ... Diğer servisler ...
 ```
 
-### 6. Frontend'i Başlat
-```bash
-cd client
-npm install
-npm run dev
-```
 
 ## 🔗 Erişim Linkleri
 

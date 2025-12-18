@@ -1,0 +1,17 @@
+# Git
+.git
+.gitignore
+
+# Frontend - Go buildleri için gereksiz
+client/node_modules
+client/.next
+client/out
+client/build
+
+# Docker
+docker-compose.yml
+Dockerfile
+
+# Temporary
+tmp
+.DS_Store

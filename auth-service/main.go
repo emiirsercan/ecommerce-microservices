@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	jwtware "github.com/gofiber/contrib/jwt"
@@ -17,6 +18,13 @@ import (
 var DB *gorm.DB
 
 const SecretKey = "benim_cok_gizli_anahtarim_senior_oluyorum"
+
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
 
 // --- KULLANICI MODELİ ---
 type User struct {
@@ -54,16 +62,32 @@ type ChangePasswordRequest struct {
 }
 
 func initDatabase() {
-	dsn := "host=localhost user=user password=password dbname=ecommerce port=5432 sslmode=disable"
+	dbHost := getEnv("DB_HOST", "localhost")
+	dbUser := getEnv("DB_USER", "user")
+	dbPass := getEnv("DB_PASSWORD", "password")
+	dbName := getEnv("DB_NAME", "ecommerce")
+	dbPort := getEnv("DB_PORT", "5432")
+
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable", dbHost, dbUser, dbPass, dbName, dbPort)
+
+	// PostgreSQL bağlantısı için retry mantığı
 	var err error
-	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	maxRetries := 30
+	for i := 0; i < maxRetries; i++ {
+		DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+		if err == nil {
+			break
+		}
+		log.Printf("⏳ PostgreSQL bağlantı bekleniyor... (%d/%d)", i+1, maxRetries)
+		time.Sleep(2 * time.Second)
+	}
 	if err != nil {
-		log.Fatal("Auth Service DB Hatası: ", err)
+		log.Fatal("❌ Auth Service PostgreSQL'e bağlanılamadı: ", err)
 	}
 
 	// Tabloları migrate et
 	DB.AutoMigrate(&User{}, &Address{})
-	fmt.Println("🚀 Auth Service Veritabanına Bağlandı!")
+	fmt.Println("✅ Auth Service Veritabanına Bağlandı!")
 
 	// Default admin kullanıcısı oluştur
 	seedAdminUser()
@@ -126,6 +150,38 @@ func main() {
 		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
 		AllowMethods: "GET, POST, HEAD, PUT, DELETE, PATCH, OPTIONS",
 	}))
+
+	// ==============================================================================
+	// HEALTH CHECK ENDPOINT
+	// ==============================================================================
+	app.Get("/health", func(c *fiber.Ctx) error {
+		checks := make(map[string]interface{})
+		status := "healthy"
+
+		// PostgreSQL kontrolü
+		sqlDB, err := DB.DB()
+		if err != nil {
+			checks["postgres"] = map[string]string{"status": "unhealthy", "message": err.Error()}
+			status = "unhealthy"
+		} else if err := sqlDB.Ping(); err != nil {
+			checks["postgres"] = map[string]string{"status": "unhealthy", "message": err.Error()}
+			status = "unhealthy"
+		} else {
+			checks["postgres"] = map[string]string{"status": "healthy", "message": "connection OK"}
+		}
+
+		statusCode := 200
+		if status != "healthy" {
+			statusCode = 503
+		}
+
+		return c.Status(statusCode).JSON(fiber.Map{
+			"status":    status,
+			"service":   "auth-service",
+			"timestamp": time.Now().Format(time.RFC3339),
+			"checks":    checks,
+		})
+	})
 
 	// =====================
 	// PUBLIC ENDPOINT'LER (Token gerektirmez)

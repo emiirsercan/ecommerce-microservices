@@ -1,0 +1,236 @@
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║                        E-COMMERCE CI/CD PIPELINE                          ║
+# ║                                                                           ║
+# ║  Bu dosya GitHub Actions workflow tanımlar.                               ║
+# ║  Her push veya PR'da otomatik olarak çalışır.                            ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1️⃣ WORKFLOW ADI
+# ═══════════════════════════════════════════════════════════════════════════
+# GitHub Actions sekmesinde görünen isim
+name: CI Pipeline
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2️⃣ TRIGGER (Tetikleyici) - Ne zaman çalışsın?
+# ═══════════════════════════════════════════════════════════════════════════
+on:
+  # Push tetikleyicisi
+  push:
+    branches: 
+      - main              # main branch'e push olunca çalış
+      - master            # master branch'e push olunca çalış
+    paths-ignore:         # Bu dosyalar değişirse ÇALIŞMA (gereksiz build önleme)
+      - '**.md'           # Markdown dosyaları
+      - '.gitignore'      # gitignore
+
+  # Pull Request tetikleyicisi  
+  pull_request:
+    branches: 
+      - main
+      - master
+
+  # Manuel tetikleme (GitHub'da "Run workflow" butonu)
+  workflow_dispatch:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3️⃣ ENVIRONMENT VARIABLES (Ortam Değişkenleri)
+# ═══════════════════════════════════════════════════════════════════════════
+env:
+  GO_VERSION: '1.21'      # Tüm job'larda kullanılacak Go versiyonu
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4️⃣ JOBS (İşler) - Paralel çalışan iş birimleri
+# ═══════════════════════════════════════════════════════════════════════════
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 1: GO SERVİSLERİ BUILD ET
+  # ─────────────────────────────────────────────────────────────────────────
+  build-go-services:
+    name: 🔨 Build Go Services    # GitHub UI'da görünen isim
+    runs-on: ubuntu-latest        # Ubuntu sanal makinede çalış
+    
+    # Strategy: Matrix ile birden fazla servisi paralel build et
+    # Bu sayede her servis için ayrı job yazmak zorunda kalmıyoruz
+    strategy:
+      matrix:
+        service:                  # Her biri için ayrı instance çalışır
+          - api-gateway
+          - auth-service
+          - product-service
+          - order-service
+          - cart-service
+          - search-service
+          - review-service
+          - wishlist-service
+          - coupon-service
+          - notification-service
+          - payment-service
+      fail-fast: false            # Bir servis fail olursa diğerleri devam etsin
+
+    # ─────────────────────────────────────────────────────────────────────
+    # STEPS (Adımlar) - Sıralı çalışan komutlar
+    # ─────────────────────────────────────────────────────────────────────
+    steps:
+      # ═══════════════════════════════════════════════════════════════════
+      # ADIM 1: KODU İNDİR (Checkout)
+      # ═══════════════════════════════════════════════════════════════════
+      # actions/checkout: GitHub'ın resmi action'ı
+      # Repo'yu runner'a clone eder
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      # ═══════════════════════════════════════════════════════════════════
+      # ADIM 2: GO KUR
+      # ═══════════════════════════════════════════════════════════════════
+      # actions/setup-go: Go'yu runner'a kurar
+      # with: Action'a parametre gönderir
+      - name: 🐹 Setup Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true               # go mod cache'i sakla (hız için)
+
+      # ═══════════════════════════════════════════════════════════════════
+      # ADIM 3: BAĞIMLILIKLARI İNDİR
+      # ═══════════════════════════════════════════════════════════════════
+      # go mod download: go.mod'daki paketleri indir
+      - name: 📦 Download Dependencies
+        run: go mod download
+
+      # ═══════════════════════════════════════════════════════════════════
+      # ADIM 4: SERVİSİ BUILD ET
+      # ═══════════════════════════════════════════════════════════════════
+      # CGO_ENABLED=0: C bağımlılığı olmadan derle (Alpine için)
+      # GOOS=linux: Linux için derle
+      # ${{ matrix.service }}: Matrix'ten gelen servis adı
+      - name: 🔨 Build ${{ matrix.service }}
+        run: |
+          echo "Building ${{ matrix.service }}..."
+          cd ${{ matrix.service }}
+          CGO_ENABLED=0 GOOS=linux go build -o main .
+          echo "✅ ${{ matrix.service }} build successful!"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # ADIM 5: BINARY'Yİ ARTIFACT OLARAK SAKLA (Opsiyonel)
+      # ═══════════════════════════════════════════════════════════════════
+      # actions/upload-artifact: Build sonucunu saklar
+      # Sonraki job'larda veya download için kullanılabilir
+      - name: 📤 Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.service }}-binary
+          path: ${{ matrix.service }}/main
+          retention-days: 7         # 7 gün sakla
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 2: DOCKER IMAGE BUILD ET
+  # ─────────────────────────────────────────────────────────────────────────
+  build-docker-images:
+    name: 🐳 Build Docker Images
+    runs-on: ubuntu-latest
+    needs: build-go-services      # build-go-services BAŞARILI olursa çalış
+    
+    strategy:
+      matrix:
+        service:
+          - api-gateway
+          - auth-service
+          - product-service
+          - order-service
+          - cart-service
+          - search-service
+          - review-service
+          - wishlist-service
+          - coupon-service
+          - notification-service
+          - payment-service
+      fail-fast: false
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      # ═══════════════════════════════════════════════════════════════════
+      # DOCKER BUILDX KURULUMU
+      # ═══════════════════════════════════════════════════════════════════
+      # Buildx: Gelişmiş Docker build aracı
+      # Multi-platform build ve cache desteği sağlar
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ═══════════════════════════════════════════════════════════════════
+      # DOCKER IMAGE BUILD
+      # ═══════════════════════════════════════════════════════════════════
+      # Sadece build et, push etme (push için Docker Hub login gerekir)
+      - name: 🔨 Build Docker Image for ${{ matrix.service }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./${{ matrix.service }}/Dockerfile
+          push: false              # Push etme, sadece build et
+          tags: ${{ matrix.service }}:latest
+          cache-from: type=gha     # GitHub Actions cache kullan
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 3: FRONTEND BUILD
+  # ─────────────────────────────────────────────────────────────────────────
+  build-frontend:
+    name: ⚛️ Build Frontend (Next.js)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      # ═══════════════════════════════════════════════════════════════════
+      # NODE.JS KUR
+      # ═══════════════════════════════════════════════════════════════════
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: client/package-lock.json
+
+      # ═══════════════════════════════════════════════════════════════════
+      # BAĞIMLILIKLARI KUR VE BUILD ET
+      # ═══════════════════════════════════════════════════════════════════
+      - name: 📦 Install Dependencies
+        working-directory: ./client
+        run: npm ci                 # ci = clean install (daha hızlı)
+
+      - name: 🔨 Build Next.js
+        working-directory: ./client
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8080
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 4: TÜM JOB'LAR BAŞARILI MI?
+  # ─────────────────────────────────────────────────────────────────────────
+  ci-success:
+    name: ✅ CI Success
+    runs-on: ubuntu-latest
+    needs: 
+      - build-go-services
+      - build-docker-images
+      - build-frontend
+    
+    steps:
+      - name: 🎉 All checks passed
+        run: |
+          echo "════════════════════════════════════════════════════════"
+          echo "🎉 CI PIPELINE BAŞARIYLA TAMAMLANDI!"
+          echo "════════════════════════════════════════════════════════"
+          echo ""
+          echo "✅ Go servisleri build edildi"
+          echo "✅ Docker image'ları oluşturuldu"
+          echo "✅ Frontend build edildi"
+          echo ""
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Author: ${{ github.actor }}"
+          echo "════════════════════════════════════════════════════════"

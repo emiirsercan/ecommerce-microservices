@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"time"
 
 	jwtware "github.com/gofiber/contrib/jwt"
 	"github.com/gofiber/fiber/v2"
@@ -16,12 +18,21 @@ const SecretKey = "benim_cok_gizli_anahtarim_senior_oluyorum"
 var rdb *redis.Client
 var ctx = context.Background()
 
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
+
 func initRedis() {
+	redisHost := getEnv("REDIS_HOST", "localhost")
+	redisPort := getEnv("REDIS_PORT", "6379")
 	// Docker içinde "redis", localde "localhost"
 	rdb = redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379", // Test ederken localhost. Docker'da "redis:6379" olmalı (ENV ile yönetilir normalde)
-		Password: "",               // Şifre yok
-		DB:       0,                // Default DB
+		Addr:     fmt.Sprintf("%s:%s", redisHost, redisPort),
+		Password: "", // Şifre yok
+		DB:       0,  // Default DB
 	})
 
 	_, err := rdb.Ping(ctx).Result()
@@ -45,6 +56,36 @@ func main() {
 		AllowHeaders: "*",
 		AllowMethods: "*",
 	}))
+
+	// ==============================================================================
+	// HEALTH CHECK ENDPOINT (JWT'den ÖNCE - public olmalı)
+	// ==============================================================================
+	app.Get("/health", func(c *fiber.Ctx) error {
+		checks := make(map[string]interface{})
+		status := "healthy"
+
+		// Redis kontrolü
+		_, err := rdb.Ping(ctx).Result()
+		if err != nil {
+			checks["redis"] = map[string]string{"status": "unhealthy", "message": err.Error()}
+			status = "unhealthy"
+		} else {
+			checks["redis"] = map[string]string{"status": "healthy", "message": "connection OK"}
+		}
+
+		statusCode := 200
+		if status != "healthy" {
+			statusCode = 503
+		}
+
+		return c.Status(statusCode).JSON(fiber.Map{
+			"status":    status,
+			"service":   "wishlist-service",
+			"timestamp": time.Now().Format(time.RFC3339),
+			"checks":    checks,
+		})
+	})
+
 	// 🔥 GÜVENLİK DUVARI (MIDDLEWARE) 🔥
 	// Buradan sonraki tüm rotalar Token ister!
 	app.Use(jwtware.New(jwtware.Config{
