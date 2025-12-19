@@ -184,6 +184,9 @@ jobs:
     steps:
       - name: 📥 Checkout Code
         uses: actions/checkout@v4
+        with:
+          submodules: true          # Submodule'leri de indir
+          fetch-depth: 0
 
       # ═══════════════════════════════════════════════════════════════════
       # NODE.JS KUR
@@ -192,15 +195,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: client/package-lock.json
+          # Cache kaldırıldı - submodule sorunu nedeniyle
 
       # ═══════════════════════════════════════════════════════════════════
       # BAĞIMLILIKLARI KUR VE BUILD ET
       # ═══════════════════════════════════════════════════════════════════
       - name: 📦 Install Dependencies
         working-directory: ./client
-        run: npm ci                 # ci = clean install (daha hızlı)
+        run: npm install            # npm ci yerine npm install (lock file olmayabilir)
 
       - name: 🔨 Build Next.js
         working-directory: ./client
