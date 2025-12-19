@@ -1,155 +1,232 @@
-# 🛒 E-Commerce Microservices Backend
+# 🛒 E-Commerce Microservices Platform
 
-Go (Fiber) ve Next.js ile geliştirilmiş mikroservis mimarisine sahip bir e-ticaret uygulaması.
+[![CI Pipeline](https://github.com/emiirsercan/ecommerce-microservices/actions/workflows/ci.yml/badge.svg)](https://github.com/emiirsercan/ecommerce-microservices/actions/workflows/ci.yml)
+![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go&logoColor=white)
+![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=next.js&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
 
-## 🏗️ Mimari
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      FRONTEND (Next.js)                     │
-│                        localhost:3000                       │
-└─────────────────────────┬───────────────────────────────────┘
-                          │
-┌─────────────────────────▼───────────────────────────────────┐
-│                    API GATEWAY (Fiber)                      │
-│                      localhost:8080                         │
-│               Prometheus Metrics: /metrics                  │
-└───┬─────────┬─────────┬─────────┬─────────┬─────────┬───────┘
-    │         │         │         │         │         │
-┌───▼───┐ ┌───▼───┐ ┌───▼───┐ ┌───▼───┐ ┌───▼───┐ ┌───▼───┐
-│ Auth  │ │Product│ │ Cart  │ │ Order │ │Search │ │Notif. │
-│ :3002 │ │ :3001 │ │ :3003 │ │ :3004 │ │ :3006 │ │ :3005 │
-└───────┘ └───────┘ └───────┘ └───────┘ └───────┘ └───────┘
-```
-
-## 🛠️ Teknolojiler
-
-**Backend:**
-- Go + Fiber Framework
-- GORM (PostgreSQL ORM)
-- JWT Authentication
-- RabbitMQ (Event-driven messaging)
-- Elasticsearch (Full-text search)
-- Prometheus + Grafana (Monitoring)
-
-**Frontend:**
-- Next.js 15 + React 19
-- TailwindCSS
-- shadcn/ui
-
-**Infrastructure:**
-- Docker & Docker Compose
-- PostgreSQL
-- Redis
-- RabbitMQ
-- Elasticsearch
-
-## 📦 Servisler
-
-| Servis | Port | Açıklama |
-|--------|------|----------|
-| API Gateway | 8080 | Tüm istekleri yönlendirir, CORS yönetimi |
-| Auth Service | 3002 | Kullanıcı kayıt/giriş, JWT token |
-| Product Service | 3001 | Ürün CRUD, stok yönetimi |
-| Cart Service | 3003 | Sepet işlemleri (Redis cache) |
-| Order Service | 3004 | Sipariş oluşturma, ödeme entegrasyonu |
-| Payment Service | 3005 | Ödeme simülasyonu |
-| Search Service | 3006 | Elasticsearch ile ürün arama |
-| Notification Service | - | RabbitMQ ile bildirim gönderimi |
-
-## 🚀 Kurulum
-
-### Gereksinimler
-- Go 1.21+
-- Node.js 18+
-- Docker & Docker Compose
-
-### 1. Projeyi Klonla
-```bash
-git clone https://github.com/KULLANICI_ADI/ecommerce-backend.git
-cd ecommerce-backend
-```
-
-### 2. Environment Değişkenlerini Ayarla
-```bash
-cp .env.example .env
-# .env dosyasını düzenle
-```
-
-### 3. Docker ile Tüm Uygulamayı Başlat (Önerilen)
-```bash
-docker-compose up --build
-```
-
-Bu komut:
-- Tüm veritabanlarını (PostgreSQL, Redis, Mongo, Elastic)
-- Tüm mikroservisleri (Go API'leri)
-- Frontend uygulamasını (Next.js)
-tek seferde ayağa kaldırır.
-
-### Erişim:
-- **Frontend:** [http://localhost:3000](http://localhost:3000)
-- **API Gateway:** [http://localhost:8080](http://localhost:8080)
+Modern mikroservis mimarisine sahip, production-ready bir e-ticaret platformu. Go (Fiber) backend, Next.js frontend, ve tam Docker desteği ile geliştirilmiştir.
 
 ---
 
-### Alternatif: Manuel Geliştirme Ortamı (Eski Yöntem)
+## ✨ Özellikler
 
-Eğer servisleri tek tek geliştirmek istiyorsanız:
+- **🏗️ Mikroservis Mimarisi** - 11 bağımsız servis, her biri kendi sorumluluğuna sahip
+- **🔐 JWT Authentication** - Güvenli kullanıcı kimlik doğrulama
+- **🐰 Event-Driven** - RabbitMQ ile asenkron mesajlaşma
+- **🔍 Full-Text Search** - Elasticsearch entegrasyonu
+- **📊 Monitoring** - Prometheus + Grafana metrikleri
+- **🐳 Docker Ready** - Tek komutla tüm sistem ayağa kalkar
+- **🏥 Health Checks** - Servis sağlık kontrolleri
+- **🔄 CI/CD** - GitHub Actions ile otomatik build
 
-1. Altyapıyı Başlat:
-```bash
-docker-compose -f docker-compose.infra.yml up -d
-# (Not: Sadece DB'ler için ayrı bir compose dosyası gerekebilir veya mevcut dosyadan ilgili servisleri seçebilirsiniz)
-# Örn: docker-compose up -d postgres redis rabbitmq elasticsearch mongo
+---
+
+## 🏛️ Sistem Mimarisi
+
+```
+                            ┌──────────────────┐
+                            │   Next.js App    │
+                            │   (Port 3000)    │
+                            └────────┬─────────┘
+                                     │
+                            ┌────────▼─────────┐
+                            │   API Gateway    │
+                            │   (Port 8080)    │
+                            │   + Prometheus   │
+                            └────────┬─────────┘
+                                     │
+        ┌────────────────────────────┼────────────────────────────┐
+        │                            │                            │
+   ┌────▼────┐  ┌────▼────┐  ┌──────▼──────┐  ┌────▼────┐  ┌────▼────┐
+   │  Auth   │  │ Product │  │    Order    │  │  Cart   │  │ Search  │
+   │ Service │  │ Service │  │   Service   │  │ Service │  │ Service │
+   └────┬────┴──┴────┬────┘  └──────┬──────┘  └────┬────┘  └────┬────┘
+        │            │              │              │            │
+   ┌────▼────────────▼──────┐  ┌───▼───┐     ┌────▼────┐  ┌────▼────┐
+   │      PostgreSQL        │  │RabbitMQ│     │  Redis  │  │ Elastic │
+   └────────────────────────┘  └───────┘     └─────────┘  └─────────┘
 ```
 
-2. Servisleri Başlat (Ayrı terminallerde):
+---
+
+## 📦 Servisler
+
+| Servis | Port | Teknoloji | Açıklama |
+|--------|------|-----------|----------|
+| **API Gateway** | 8080 | Go/Fiber | Request routing, CORS, rate limiting |
+| **Auth Service** | 3002 | Go/Fiber | JWT auth, kullanıcı yönetimi |
+| **Product Service** | 3001 | Go/Fiber | Ürün CRUD, kategori, stok |
+| **Order Service** | 3004 | Go/Fiber | Sipariş işlemleri, ödeme |
+| **Cart Service** | 3003 | Go/Fiber | Sepet (Redis cache) |
+| **Search Service** | 3006 | Go/Fiber | Elasticsearch arama |
+| **Review Service** | 3008 | Go/Fiber | Ürün yorumları (MongoDB) |
+| **Wishlist Service** | 3009 | Go/Fiber | Favoriler (Redis) |
+| **Coupon Service** | 3010 | Go/Fiber | Kupon yönetimi |
+| **Payment Service** | 3005 | Go/Fiber | Ödeme simülasyonu |
+| **Notification Service** | - | Go | RabbitMQ consumer |
+
+---
+
+## 🛠️ Teknoloji Stack
+
+### Backend
+- **Go 1.21+** - Ana programlama dili
+- **Fiber v2** - Hızlı HTTP framework
+- **GORM** - PostgreSQL ORM
+- **JWT** - Kimlik doğrulama
+- **RabbitMQ** - Message broker
+
+### Frontend
+- **Next.js 15** - React framework
+- **React 19** - UI library
+- **TailwindCSS** - Styling
+- **shadcn/ui** - UI components
+
+### Altyapı
+- **Docker & Docker Compose** - Containerization
+- **PostgreSQL** - Ana veritabanı
+- **Redis** - Cache & session
+- **MongoDB** - Review storage
+- **Elasticsearch** - Full-text search
+- **Prometheus + Grafana** - Monitoring
+
+---
+
+## 🚀 Hızlı Başlangıç
+
+### Gereksinimler
+- Docker & Docker Compose
+- Git
+
+### Kurulum
+
 ```bash
-# Terminal 1 - API Gateway
-cd api-gateway && go run main.go
+# 1. Repo'yu klonla
+git clone https://github.com/emiirsercan/ecommerce-microservices.git
+cd ecommerce-microservices
 
-# Terminal 2 - Auth Service
-cd auth-service && go run main.go
+# 2. Tüm servisleri başlat
+docker-compose up --build
 
-# ... Diğer servisler ...
+# 3. Tarayıcıda aç
+# Frontend: http://localhost:3000
+# API: http://localhost:8080
 ```
 
-
-## 🔗 Erişim Linkleri
+### Erişim Noktaları
 
 | Servis | URL |
 |--------|-----|
-| Frontend | http://localhost:3000 |
-| API Gateway | http://localhost:8080 |
-| RabbitMQ Panel | http://localhost:15672 (guest/guest) |
-| Grafana | http://localhost:3007 |
-| Prometheus | http://localhost:9090 |
+| 🌐 Frontend | http://localhost:3000 |
+| 🔌 API Gateway | http://localhost:8080 |
+| 🐰 RabbitMQ Panel | http://localhost:15672 |
+| 📊 Prometheus | http://localhost:9090 |
+| 📈 Grafana | http://localhost:3007 |
 
-## 📝 API Endpoints
+---
 
-### Auth (`/api/auth`)
-- `POST /register` - Kayıt ol
-- `POST /login` - Giriş yap
+## 📡 API Endpoints
 
-### Products (`/api/products`)
-- `GET /` - Tüm ürünleri listele
-- `GET /:id` - Ürün detayı
-- `POST /` - Ürün ekle (Auth gerekli)
+### Authentication
+```
+POST /api/auth/register    # Kullanıcı kaydı
+POST /api/auth/login       # Giriş
+GET  /api/auth/me          # Profil bilgisi
+```
 
-### Cart (`/api/cart`)
-- `GET /:userId` - Sepeti getir
-- `POST /add` - Sepete ekle
-- `DELETE /:userId/:productId` - Sepetten sil
+### Products
+```
+GET    /api/products       # Ürün listesi (pagination)
+GET    /api/products/:id   # Ürün detayı
+POST   /api/products       # Ürün ekle (Admin)
+PUT    /api/products/:id   # Ürün güncelle
+DELETE /api/products/:id   # Ürün sil
+```
 
-### Orders (`/api/orders`)
-- `POST /` - Sipariş oluştur
-- `GET /user/:userId` - Kullanıcı siparişleri
+### Orders
+```
+GET  /api/orders           # Tüm siparişler (Admin)
+GET  /api/orders/user/:id  # Kullanıcı siparişleri
+POST /api/orders           # Sipariş oluştur
+```
 
-### Search (`/api/search`)
-- `GET /?q=keyword` - Ürün ara
+### Search
+```
+GET /api/search?q=keyword  # Ürün ara
+```
+
+### Health Check
+```
+GET /health                # Her servis için sağlık kontrolü
+```
+
+---
+
+## 🔧 Geliştirme
+
+### Lokal Geliştirme (Docker olmadan)
+
+```bash
+# Sadece altyapıyı başlat
+docker-compose up -d postgres redis rabbitmq elasticsearch mongo
+
+# Servisi çalıştır
+cd product-service && go run main.go
+```
+
+### Test
+
+```bash
+# Tüm servislerin health check'i
+curl http://localhost:8080/health
+curl http://localhost:3001/health
+curl http://localhost:3002/health
+```
+
+---
+
+## 📁 Proje Yapısı
+
+```
+ecommerce-microservices/
+├── api-gateway/          # API Gateway servisi
+├── auth-service/         # Kimlik doğrulama
+├── product-service/      # Ürün yönetimi
+├── order-service/        # Sipariş işlemleri
+├── cart-service/         # Sepet (Redis)
+├── search-service/       # Elasticsearch arama
+├── review-service/       # Yorumlar (MongoDB)
+├── wishlist-service/     # Favoriler
+├── coupon-service/       # Kupon yönetimi
+├── payment-service/      # Ödeme simülasyonu
+├── notification-service/ # Bildirimler
+├── client/               # Next.js frontend
+├── pkg/                  # Shared packages
+├── infra/                # Infra configs
+├── .github/workflows/    # CI/CD pipeline
+└── docker-compose.yml    # Docker orchestration
+```
+
+---
+
+## 🤝 Katkıda Bulunma
+
+1. Fork edin
+2. Feature branch oluşturun (`git checkout -b feature/amazing-feature`)
+3. Commit edin (`git commit -m 'feat: add amazing feature'`)
+4. Push edin (`git push origin feature/amazing-feature`)
+5. Pull Request açın
+
+---
 
 ## 📄 Lisans
 
-MIT
+Bu proje MIT lisansı altında lisanslanmıştır. Detaylar için [LICENSE](LICENSE) dosyasına bakın.
 
+---
+
+<p align="center">
+  Made with ❤️ using Go & Next.js
+</p>
