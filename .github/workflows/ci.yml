@@ -184,9 +184,6 @@ jobs:
     steps:
       - name: 📥 Checkout Code
         uses: actions/checkout@v4
-        with:
-          submodules: true          # Submodule'leri de indir
-          fetch-depth: 0
 
       # ═══════════════════════════════════════════════════════════════════
       # NODE.JS KUR
